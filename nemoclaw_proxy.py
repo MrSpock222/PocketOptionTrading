@@ -1,14 +1,19 @@
 """
 NemoClaw → OpenAI-kompatibler HTTP Proxy
 =========================================
-Da der OpenClaw Gateway chatCompletions Endpoint in der Sandbox
-gesperrt ist, leiten wir Requests über die OpenClaw CLI weiter.
+Leitet Requests durch die NemoClaw Sandbox an den NVIDIA Inference Server.
+
+Methode:
+  Piped curl durch `nemoclaw money connect` — der einzige stabile Weg,
+  da der Gateway chatCompletions gesperrt ist und der Inference-Server
+  (inference.local) nur innerhalb der Sandbox erreichbar ist.
 
 Architektur:
   Bot (httpx.post) → localhost:18790/v1/chat/completions
                     → dieser Proxy
-                    → openclaw agent -m "..." (Subprocess)
-                    → Antwort als OpenAI-JSON zurück
+                    → echo '...' | nemoclaw money connect
+                    → curl -sk https://inference.local/v1/chat/completions
+                    → OpenAI-JSON zurück
 
 Start:
   python nemoclaw_proxy.py
@@ -16,14 +21,16 @@ Start:
 Env-Variablen:
   NEMOCLAW_PROXY_PORT   — Port (default: 18790)
   NEMOCLAW_PROXY_TOKEN  — Bearer Token für Auth (default: leer = kein Auth)
-  NEMOCLAW_AGENT        — Agent-Name (default: main)
-  NEMOCLAW_SESSION_ID   — Session-ID für OpenClaw (default: trading-bot)
-  NEMOCLAW_TIMEOUT      — Timeout in Sekunden für CLI (default: 120)
+  NEMOCLAW_SANDBOX      — Sandbox-Name (default: money)
+  NEMOCLAW_TIMEOUT      — Timeout in Sekunden (default: 120)
+  NEMOCLAW_MODEL        — Default-Modell (default: nvidia/nemotron-3-super-120b-a12b)
 """
 import asyncio
+import base64
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -65,166 +72,145 @@ logger = logging.getLogger("nemoclaw-proxy")
 # ---------------------------------------------------------------------------
 PROXY_PORT = int(os.getenv("NEMOCLAW_PROXY_PORT", "18790"))
 PROXY_TOKEN = os.getenv("NEMOCLAW_PROXY_TOKEN", "")
-AGENT_NAME = os.getenv("NEMOCLAW_AGENT", "main")
-SESSION_ID = os.getenv("NEMOCLAW_SESSION_ID", "trading-bot")
+SANDBOX_NAME = os.getenv("NEMOCLAW_SANDBOX", "money")
 CLI_TIMEOUT = int(os.getenv("NEMOCLAW_TIMEOUT", "120"))
+DEFAULT_MODEL = os.getenv("NEMOCLAW_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+INFERENCE_URL = "https://inference.local/v1/chat/completions"
+
 
 # ---------------------------------------------------------------------------
-# OpenClaw CLI Wrapper
+# NemoClaw Sandbox Inference Call
 # ---------------------------------------------------------------------------
-async def call_openclaw(messages: list[dict], model: str = "",
-                        temperature: float = 0.3) -> str:
+async def call_inference(messages: list[dict], model: str = "",
+                         temperature: float = 0.3) -> dict:
     """
-    Ruft OpenClaw über die CLI auf und gibt die Antwort als Text zurück.
+    Sendet Request an den NVIDIA Inference Server DURCH die NemoClaw Sandbox.
 
-    Versucht mehrere Methoden:
-    1. openclaw agent --agent <name> --local -m "<prompt>"
-    2. Falls das nicht verfügbar: nemoclaw exec openclaw agent ...
-    3. Fallback: Direkter HTTP-Call an den Gateway (für den Fall,
-       dass chatCompletions doch irgendwann aktiviert wird)
+    Methode: Piped curl durch `nemoclaw <sandbox> connect`
+    - Base64-kodiert den Payload (vermeidet Escaping-Probleme)
+    - Dekodiert in der Sandbox und piped an curl
+    - Parst die JSON-Antwort aus dem Output
     """
-    # Baue den vollständigen Prompt aus den Messages zusammen
-    prompt_parts = []
-    system_prompt = ""
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if role == "system":
-            system_prompt = content
-        elif role == "user":
-            prompt_parts.append(content)
-        elif role == "assistant":
-            prompt_parts.append(f"[Assistant]: {content}")
+    payload = json.dumps({
+        "model": model or DEFAULT_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+    })
 
-    full_prompt = "\n\n".join(prompt_parts)
-    if system_prompt:
-        full_prompt = f"[System Instructions]: {system_prompt}\n\n{full_prompt}"
+    # Base64-Encoding verhindert Escaping-Probleme mit Quotes/Sonderzeichen
+    payload_b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
 
-    # Methode 1: openclaw agent CLI
-    result = await _try_openclaw_cli(full_prompt)
-    if result:
-        return result
-
-    # Methode 2: nemoclaw exec
-    result = await _try_nemoclaw_exec(full_prompt)
-    if result:
-        return result
-
-    # Methode 3: Direkter HTTP-Call (Fallback)
-    result = await _try_http_gateway(messages, model, temperature)
-    if result:
-        return result
-
-    raise RuntimeError(
-        "Alle NemoClaw-Kommunikationswege fehlgeschlagen. "
-        "Prüfe ob OpenClaw/NemoClaw installiert und erreichbar ist."
+    # Sandbox-Befehl: Base64 dekodieren → an curl pipen
+    sandbox_cmd = (
+        f"echo '{payload_b64}' | base64 -d | "
+        f"curl -sk {INFERENCE_URL} "
+        f"-X POST -H 'Content-Type: application/json' -d @- "
+        f"2>/dev/null && exit"
     )
 
+    # Durch nemoclaw connect pipen
+    shell_cmd = f"echo {_shell_quote(sandbox_cmd)} | nemoclaw {SANDBOX_NAME} connect"
 
-async def _try_openclaw_cli(prompt: str) -> str | None:
-    """Versucht openclaw agent CLI."""
-    cmd = [
-        "openclaw", "agent",
-        "--agent", AGENT_NAME,
-        "--local",
-        "-m", prompt,
-        "--session-id", SESSION_ID,
-    ]
-    return await _run_subprocess(cmd, "openclaw CLI")
+    logger.info("Sende Request an Inference Server (model=%s, %d messages)", model or DEFAULT_MODEL, len(messages))
 
-
-async def _try_nemoclaw_exec(prompt: str) -> str | None:
-    """Versucht nemoclaw exec openclaw agent CLI."""
-    cmd = [
-        "nemoclaw", "exec", "--",
-        "openclaw", "agent",
-        "--agent", AGENT_NAME,
-        "-m", prompt,
-        "--session-id", SESSION_ID,
-    ]
-    return await _run_subprocess(cmd, "nemoclaw exec")
-
-
-async def _run_subprocess(cmd: list[str], label: str) -> str | None:
-    """Führt einen Subprocess aus und gibt stdout zurück."""
     try:
-        logger.info("[%s] Starte: %s", label, " ".join(cmd[:4]) + "...")
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
+        proc = await asyncio.create_subprocess_shell(
+            shell_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=CLI_TIMEOUT
         )
-        if proc.returncode == 0 and stdout:
-            text = stdout.decode("utf-8", errors="replace").strip()
-            if text:
-                logger.info("[%s] Erfolg (%d Zeichen)", label, len(text))
-                return text
-        if stderr:
-            err = stderr.decode("utf-8", errors="replace").strip()
-            logger.warning("[%s] stderr: %s", label, err[:200])
-        return None
-    except FileNotFoundError:
-        logger.info("[%s] Nicht installiert/gefunden", label)
-        return None
     except asyncio.TimeoutError:
-        logger.warning("[%s] Timeout nach %ds", label, CLI_TIMEOUT)
+        logger.error("Timeout nach %ds", CLI_TIMEOUT)
         try:
             proc.kill()
         except Exception:
             pass
-        return None
+        raise RuntimeError(f"NemoClaw Sandbox Timeout nach {CLI_TIMEOUT}s")
     except Exception as e:
-        logger.warning("[%s] Fehler: %s", label, e)
-        return None
+        logger.error("Subprocess-Fehler: %s", e)
+        raise RuntimeError(f"NemoClaw Subprocess-Fehler: {e}")
+
+    output = stdout.decode("utf-8", errors="replace")
+
+    if stderr:
+        err = stderr.decode("utf-8", errors="replace").strip()
+        if err and "Connecting" not in err:
+            logger.warning("stderr: %s", err[:300])
+
+    # JSON aus dem Output extrahieren
+    result = _extract_json(output)
+    if result is None:
+        logger.error("Keine JSON-Antwort gefunden. Output (%d Zeichen): %s", len(output), output[:500])
+        raise RuntimeError("Keine gültige JSON-Antwort vom Inference Server erhalten")
+
+    logger.info("Inference-Antwort erhalten (%d Zeichen)", len(json.dumps(result)))
+    return result
 
 
-async def _try_http_gateway(messages: list[dict], model: str,
-                            temperature: float) -> str | None:
-    """Fallback: Versucht direkten HTTP-Call an den Gateway."""
-    try:
-        import httpx
-    except ImportError:
-        return None
+def _shell_quote(s: str) -> str:
+    """Shell-sicheres Quoting für den Befehl."""
+    return "'" + s.replace("'", "'\\''") + "'"
 
-    gateway_url = os.getenv("NEMOCLAW_GATEWAY_URL", "http://localhost:18789")
-    gateway_token = os.getenv("NEMOCLAW_TOKEN", "")
 
-    payload = {
-        "model": model or "nvidia/nemotron-3-super-120b-a12b",
-        "messages": messages,
-        "temperature": temperature,
-    }
-    headers = {"Content-Type": "application/json"}
-    if gateway_token:
-        headers["Authorization"] = f"Bearer {gateway_token}"
+def _extract_json(output: str) -> dict | None:
+    """
+    Extrahiert das erste vollständige JSON-Objekt aus dem Output.
+    Der Output enthält Banner-Text, den Echo des Befehls, die JSON-Antwort und 'exit'.
+    """
+    # Strategie 1: Suche nach dem typischen OpenAI-Response-Start
+    patterns = [
+        r'\{"id":"chatcmpl-[^}]+.*?\}(?=\s*exit|\s*$)',  # chatcmpl response
+        r'\{"id":".+?"choices":.+?\}',  # Generic OpenAI response
+        r'\{"error":.+?\}',  # Error response
+    ]
 
-    try:
-        async with httpx.AsyncClient(timeout=CLI_TIMEOUT) as client:
-            resp = await client.post(
-                f"{gateway_url}/v1/chat/completions",
-                json=payload,
-                headers=headers,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if "choices" in data:
-                    text = data["choices"][0]["message"]["content"]
-                    logger.info("[HTTP Gateway] Erfolg (%d Zeichen)", len(text))
-                    return text
-            logger.warning(
-                "[HTTP Gateway] Status %d: %s", resp.status_code, resp.text[:200]
-            )
-            return None
-    except Exception as e:
-        logger.warning("[HTTP Gateway] Fehler: %s", e)
-        return None
+    # Strategie 2: Finde alle JSON-Objekte mit Brace-Matching
+    depth = 0
+    start = -1
+    for i, ch in enumerate(output):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start >= 0:
+                candidate = output[start:i + 1]
+                try:
+                    parsed = json.loads(candidate)
+                    # Prüfe ob es eine OpenAI-Response oder Error ist
+                    if isinstance(parsed, dict) and ("choices" in parsed or "error" in parsed or "id" in parsed):
+                        return parsed
+                except json.JSONDecodeError:
+                    continue
+                start = -1
+
+    # Strategie 3: Fallback — finde irgendeinen JSON-Block
+    depth = 0
+    start = -1
+    for i, ch in enumerate(output):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start >= 0:
+                candidate = output[start:i + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+                start = -1
+
+    return None
 
 
 # ---------------------------------------------------------------------------
-# HTTP Server (aiohttp — leichtgewichtig, keine FastAPI-Dependency nötig)
+# HTTP Server (aiohttp)
 # ---------------------------------------------------------------------------
 async def handle_chat_completions(request):
     """POST /v1/chat/completions — OpenAI-kompatibles Format."""
@@ -250,7 +236,7 @@ async def handle_chat_completions(request):
         )
 
     messages = body.get("messages", [])
-    model = body.get("model", "nvidia/nemotron-3-super-120b-a12b")
+    model = body.get("model", DEFAULT_MODEL)
     temperature = body.get("temperature", 0.3)
 
     if not messages:
@@ -264,40 +250,17 @@ async def handle_chat_completions(request):
         model, len(messages), temperature,
     )
 
-    # An NemoClaw weiterleiten
+    # An Inference Server weiterleiten (durch Sandbox)
     try:
-        content = await call_openclaw(messages, model, temperature)
+        result = await call_inference(messages, model, temperature)
     except RuntimeError as e:
         return web.json_response(
             {"error": {"message": str(e), "type": "server_error"}},
             status=502,
         )
 
-    # OpenAI-kompatible Response
-    response = {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                },
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": sum(len(m.get("content", "")) for m in messages) // 4,
-            "completion_tokens": len(content) // 4,
-            "total_tokens": (sum(len(m.get("content", "")) for m in messages) + len(content)) // 4,
-        },
-    }
-
-    logger.info("Response: %d Zeichen Content", len(content))
-    return web.json_response(response)
+    # Die Inference-Antwort ist bereits im OpenAI-Format — direkt weiterleiten
+    return web.json_response(result)
 
 
 async def handle_models(request):
@@ -307,7 +270,7 @@ async def handle_models(request):
         "object": "list",
         "data": [
             {
-                "id": "nvidia/nemotron-3-super-120b-a12b",
+                "id": DEFAULT_MODEL,
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "nvidia",
@@ -319,7 +282,12 @@ async def handle_models(request):
 async def handle_health(request):
     """GET /health — Health-Check."""
     from aiohttp import web
-    return web.json_response({"status": "ok", "proxy": "nemoclaw-proxy"})
+    return web.json_response({
+        "status": "ok",
+        "proxy": "nemoclaw-proxy",
+        "sandbox": SANDBOX_NAME,
+        "model": DEFAULT_MODEL,
+    })
 
 
 async def start_server():
@@ -338,11 +306,14 @@ async def start_server():
 
     logger.info("=" * 60)
     logger.info("NemoClaw Proxy gestartet!")
-    logger.info("  Endpoint: http://localhost:%d/v1/chat/completions", PROXY_PORT)
-    logger.info("  Health:   http://localhost:%d/health", PROXY_PORT)
-    logger.info("  Auth:     %s", "Bearer Token aktiv" if PROXY_TOKEN else "DEAKTIVIERT")
-    logger.info("  Agent:    %s (Session: %s)", AGENT_NAME, SESSION_ID)
-    logger.info("  Timeout:  %ds", CLI_TIMEOUT)
+    logger.info("  Endpoint:  http://localhost:%d/v1/chat/completions", PROXY_PORT)
+    logger.info("  Health:    http://localhost:%d/health", PROXY_PORT)
+    logger.info("  Auth:      %s", "Bearer Token aktiv" if PROXY_TOKEN else "DEAKTIVIERT")
+    logger.info("  Sandbox:   %s", SANDBOX_NAME)
+    logger.info("  Model:     %s", DEFAULT_MODEL)
+    logger.info("  Inference: %s", INFERENCE_URL)
+    logger.info("  Timeout:   %ds", CLI_TIMEOUT)
+    logger.info("  Methode:   Piped curl durch nemoclaw connect")
     logger.info("=" * 60)
 
     # Laufe endlos
@@ -361,19 +332,19 @@ def main():
         import aiohttp  # noqa: F401
     except ImportError:
         logger.error("aiohttp nicht installiert! Installiere mit: pip install aiohttp")
-        logger.error("Oder füge 'aiohttp' zu requirements.txt hinzu")
         sys.exit(1)
 
     print(f"""
-╔══════════════════════════════════════════════════╗
-║       NemoClaw → OpenAI Proxy Server             ║
-╠══════════════════════════════════════════════════╣
-║  Port:    {PROXY_PORT:<39}║
-║  Auth:    {"Aktiv (Bearer Token)" if PROXY_TOKEN else "Deaktiviert":<39}║
-║  Agent:   {AGENT_NAME:<39}║
-║  Session: {SESSION_ID:<39}║
-║  Timeout: {CLI_TIMEOUT}s{" " * (37 - len(str(CLI_TIMEOUT)))}║
-╚══════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════╗
+║       NemoClaw → OpenAI Proxy Server                 ║
+╠══════════════════════════════════════════════════════╣
+║  Port:     {PROXY_PORT:<42}║
+║  Auth:     {"Aktiv (Bearer Token)" if PROXY_TOKEN else "Deaktiviert":<42}║
+║  Sandbox:  {SANDBOX_NAME:<42}║
+║  Model:    {DEFAULT_MODEL:<42}║
+║  Timeout:  {CLI_TIMEOUT}s{" " * (40 - len(str(CLI_TIMEOUT)))}║
+║  Methode:  Piped curl → nemoclaw connect             ║
+╚══════════════════════════════════════════════════════╝
 """)
     asyncio.run(start_server())
 
