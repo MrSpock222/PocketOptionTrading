@@ -56,11 +56,12 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# NemoClaw Gateway Client (OpenAI-kompatible HTTP API auf Port 18789)
+# NemoClaw Client (über Proxy auf Port 18790, da Gateway gesperrt)
 # ---------------------------------------------------------------------------
 class NemoClawClient:
     """
-    Verbindet sich mit NemoClaw Gateway auf localhost:18789.
+    Verbindet sich mit NemoClaw über unseren Proxy auf localhost:18790.
+    (Gateway chatCompletions auf Port 18789 ist durch Sandbox gesperrt.)
     Sendet Indikator-Daten + Trade-Historie an die KI zur Analyse.
     Nutzt OpenAI-kompatibles /v1/chat/completions Format.
     """
@@ -197,7 +198,7 @@ class TradingBotState:
         self.ssid_real = os.getenv("POCKET_OPTION_SSID_REAL", "")
         self.history: list[dict] = []
         self.nemoclaw = NemoClawClient(
-            base_url=os.getenv("NEMOCLAW_URL", "http://localhost:18789"),
+            base_url=os.getenv("NEMOCLAW_URL", "http://localhost:18790"),
             token=os.getenv("NEMOCLAW_TOKEN", ""),
         )
         self.risk = RiskManager(base_amount=self.base_amount)

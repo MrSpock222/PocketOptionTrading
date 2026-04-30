@@ -116,8 +116,10 @@ echo ""
 # ---------------------------------------------------------------------------
 # 4. .env Datei erstellen
 # ---------------------------------------------------------------------------
-echo "[4/4] Erstelle .env Datei..."
+echo "[4/6] Erstelle .env Datei..."
 
+PROXY_PORT=18790
+PROXY_TOKEN=$(openssl rand -hex 16 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(16))")
 ENV_FILE="$BOT_DIR/.env"
 
 if [ ! -f "$ENV_FILE" ]; then
@@ -132,9 +134,20 @@ TELEGRAM_BOT_TOKEN="HIER_DEIN_TELEGRAM_TOKEN"
 POCKET_OPTION_SSID_DEMO="HIER_DEINE_DEMO_SSID"
 POCKET_OPTION_SSID_REAL="HIER_DEINE_REAL_SSID"
 
-# OpenClaw — läuft auf localhost, kein externer Server nötig!
-OPENCLAW_URL="http://localhost:$GATEWAY_PORT"
-OPENCLAW_TOKEN="$GATEWAY_TOKEN"
+# NemoClaw Proxy (OpenAI-kompatibler Wrapper)
+# Der Proxy leitet an OpenClaw CLI weiter (Gateway chatCompletions ist gesperrt)
+NEMOCLAW_URL="http://localhost:$PROXY_PORT"
+NEMOCLAW_TOKEN="$PROXY_TOKEN"
+
+# Proxy-Server Konfiguration
+NEMOCLAW_PROXY_PORT="$PROXY_PORT"
+NEMOCLAW_PROXY_TOKEN="$PROXY_TOKEN"
+NEMOCLAW_AGENT="main"
+NEMOCLAW_SESSION_ID="trading-bot"
+NEMOCLAW_TIMEOUT="120"
+
+# Fallback: Direkter Gateway (falls chatCompletions doch aktiviert wird)
+NEMOCLAW_GATEWAY_URL="http://localhost:$GATEWAY_PORT"
 EOF
     echo "  ✅ .env erstellt: $ENV_FILE"
     echo ""
@@ -142,9 +155,44 @@ EOF
     echo "     nano $ENV_FILE"
 else
     echo "  .env existiert bereits. Übersprungen."
-    echo "  Falls nötig, aktualisiere OPENCLAW_TOKEN auf: $GATEWAY_TOKEN"
+    echo "  Falls nötig, aktualisiere NEMOCLAW_PROXY_TOKEN auf: $PROXY_TOKEN"
 fi
 
+echo ""
+
+# ---------------------------------------------------------------------------
+# 5. NemoClaw Proxy als systemd Service einrichten
+# ---------------------------------------------------------------------------
+echo "[5/6] Richte NemoClaw Proxy Service ein..."
+
+PROXY_SERVICE="/etc/systemd/system/nemoclaw-proxy.service"
+
+if [ -f "$BOT_DIR/nemoclaw-proxy.service" ]; then
+    # Service-Datei anpassen (WorkingDirectory + User)
+    sed "s|/opt/pocketoption-bot|$BOT_DIR|g" "$BOT_DIR/nemoclaw-proxy.service" | \
+    sed "s|User=%i|User=$(whoami)|g" > /tmp/nemoclaw-proxy.service
+
+    if sudo cp /tmp/nemoclaw-proxy.service "$PROXY_SERVICE" 2>/dev/null; then
+        sudo systemctl daemon-reload
+        sudo systemctl enable nemoclaw-proxy
+        echo "  ✅ Proxy-Service installiert und aktiviert"
+        echo "  Starte mit: sudo systemctl start nemoclaw-proxy"
+    else
+        echo "  ⚠️  Konnte Service nicht installieren (sudo nötig)"
+        echo "  Manuell starten: python3 $BOT_DIR/nemoclaw_proxy.py"
+    fi
+    rm -f /tmp/nemoclaw-proxy.service
+else
+    echo "  ⚠️  nemoclaw-proxy.service nicht gefunden"
+    echo "  Manuell starten: python3 $BOT_DIR/nemoclaw_proxy.py"
+fi
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# 6. Fertig
+# ---------------------------------------------------------------------------
+echo "[6/6] Fertig!"
 echo ""
 echo "============================================="
 echo " ✅ Setup abgeschlossen!"
@@ -152,15 +200,19 @@ echo "============================================="
 echo ""
 echo " Architektur auf diesem Server:"
 echo ""
-echo "   ┌──────────────────────────────┐"
-echo "   │      Ubuntu Server           │"
-echo "   │                              │"
-echo "   │  ┌─────────┐  ┌──────────┐  │"
-echo "   │  │ bot.py   │→→│ OpenClaw │  │"
-echo "   │  │ (Trading)│  │ (KI)     │  │"
-echo "   │  └────┬─────┘  └──────────┘  │"
-echo "   │       │ localhost:$GATEWAY_PORT       │"
-echo "   └───────┼──────────────────────┘"
+echo "   ┌──────────────────────────────────────┐"
+echo "   │          Ubuntu Server                │"
+echo "   │                                       │"
+echo "   │  ┌─────────┐   ┌────────────────┐    │"
+echo "   │  │ bot.py   │──→│ nemoclaw_proxy │    │"
+echo "   │  │ (Trading)│   │ :$PROXY_PORT          │"
+echo "   │  └────┬─────┘   └───────┬────────┘   │"
+echo "   │       │                  │             │"
+echo "   │       │          ┌───────▼────────┐   │"
+echo "   │       │          │ OpenClaw CLI   │   │"
+echo "   │       │          │ (Sandbox)      │   │"
+echo "   │       │          └────────────────┘   │"
+echo "   └───────┼───────────────────────────────┘"
 echo "           │"
 echo "    ┌──────┴───────┐"
 echo "    │  Telegram     │"
@@ -168,12 +220,14 @@ echo "    │  + PocketOpt. │"
 echo "    └──────────────┘"
 echo ""
 echo " Nächste Schritte:"
-echo "   1. Trage Tokens ein:  nano $ENV_FILE"
-echo "   2. Starte OpenClaw:   openclaw restart"
-echo "   3. Starte den Bot:    cd $BOT_DIR && python3 bot.py"
+echo "   1. Trage Tokens ein:       nano $ENV_FILE"
+echo "   2. Starte den Proxy:       sudo systemctl start nemoclaw-proxy"
+echo "   3. Teste den Proxy:        curl http://localhost:$PROXY_PORT/health"
+echo "   4. Starte den Bot:         cd $BOT_DIR && python3 bot.py"
 echo ""
-echo " Dein OpenClaw Gateway Token ist:"
-echo "   $GATEWAY_TOKEN"
+echo " Dein Proxy Token ist:"
+echo "   $PROXY_TOKEN"
 echo ""
 echo " ⚠️  MERKE DIR DIESEN TOKEN — er steht auch in .env"
 echo ""
+

@@ -1,0 +1,29 @@
+[Unit]
+Description=NemoClaw OpenAI-compatible Proxy Server
+Documentation=https://github.com/PocketOptionTrading
+After=network.target
+# Starte nach OpenClaw, falls als Service vorhanden
+After=openclaw.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/pocketoption-bot
+ExecStart=/usr/bin/python3 /opt/pocketoption-bot/nemoclaw_proxy.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nemoclaw-proxy
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/pocketoption-bot
+
+[Install]
+WantedBy=multi-user.target
