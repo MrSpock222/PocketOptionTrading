@@ -257,6 +257,153 @@ def obv_trend(closes: list[float], volumes: list[float], period: int = 10) -> Op
 
 
 # ---------------------------------------------------------------------------
+# Advanced Indicators
+# ---------------------------------------------------------------------------
+def supertrend(highs: list[float], lows: list[float], closes: list[float], period: int = 10, multiplier: float = 3.0) -> dict:
+    """Supertrend Indicator."""
+    if len(closes) < period + 1:
+        return {"value": None, "trend": "neutral"}
+    
+    tr = _true_range(highs, lows, closes)
+    atr = _sma(tr, period)
+    
+    basic_ub = [(highs[i] + lows[i]) / 2 + multiplier * atr[i] if atr[i] is not None else 0 for i in range(len(closes))]
+    basic_lb = [(highs[i] + lows[i]) / 2 - multiplier * atr[i] if atr[i] is not None else 0 for i in range(len(closes))]
+    
+    final_ub = [0.0] * len(closes)
+    final_lb = [0.0] * len(closes)
+    trend = [1] * len(closes)  # 1 for bull, -1 for bear
+    
+    for i in range(period, len(closes)):
+        final_ub[i] = basic_ub[i] if basic_ub[i] < final_ub[i-1] or closes[i-1] > final_ub[i-1] else final_ub[i-1]
+        final_lb[i] = basic_lb[i] if basic_lb[i] > final_lb[i-1] or closes[i-1] < final_lb[i-1] else final_lb[i-1]
+        
+        if trend[i-1] == 1 and closes[i] < final_lb[i]:
+            trend[i] = -1
+        elif trend[i-1] == -1 and closes[i] > final_ub[i]:
+            trend[i] = 1
+        else:
+            trend[i] = trend[i-1]
+            
+    st = final_lb[-1] if trend[-1] == 1 else final_ub[-1]
+    return {"value": st, "trend": "bullish" if trend[-1] == 1 else "bearish"}
+
+
+def keltner_channels(highs: list[float], lows: list[float], closes: list[float], period: int = 20, multiplier: float = 1.5) -> dict:
+    """Keltner Channels."""
+    if len(closes) < period + 1:
+        return {"upper": None, "middle": None, "lower": None}
+    
+    ema_center = _ema(closes, period)
+    tr = _true_range(highs, lows, closes)
+    atr = _ema(tr, period)
+    
+    upper = ema_center[-1] + multiplier * atr[-1]
+    lower = ema_center[-1] - multiplier * atr[-1]
+    
+    return {"upper": upper, "middle": ema_center[-1], "lower": lower}
+
+
+def awesome_oscillator(highs: list[float], lows: list[float]) -> dict:
+    """Awesome Oscillator (AO). SMA(5) - SMA(34) of median price."""
+    if len(highs) < 34:
+        return {"ao": None, "signal": "neutral"}
+    
+    median = [(h + l) / 2 for h, l in zip(highs, lows)]
+    sma5 = _sma(median, 5)
+    sma34 = _sma(median, 34)
+    
+    ao = [s5 - s34 if s5 is not None and s34 is not None else 0 for s5, s34 in zip(sma5, sma34)]
+    
+    signal = "neutral"
+    if ao[-1] > 0 and ao[-1] > ao[-2]:
+        signal = "bullish"
+    elif ao[-1] < 0 and ao[-1] < ao[-2]:
+        signal = "bearish"
+    
+    return {"ao": ao[-1], "signal": signal}
+
+
+def money_flow_index(highs: list[float], lows: list[float], closes: list[float], volumes: list[float], period: int = 14) -> Optional[float]:
+    """Money Flow Index (MFI). RSI weighted by volume."""
+    if len(closes) < period + 1 or sum(volumes) == 0:
+        return None
+    
+    typical_price = [(h + l + c) / 3 for h, l, c in zip(highs, lows, closes)]
+    raw_money_flow = [tp * v for tp, v in zip(typical_price, volumes)]
+    
+    positive_flow = []
+    negative_flow = []
+    
+    for i in range(1, len(typical_price)):
+        if typical_price[i] > typical_price[i-1]:
+            positive_flow.append(raw_money_flow[i])
+            negative_flow.append(0.0)
+        elif typical_price[i] < typical_price[i-1]:
+            positive_flow.append(0.0)
+            negative_flow.append(raw_money_flow[i])
+        else:
+            positive_flow.append(0.0)
+            negative_flow.append(0.0)
+            
+    if len(positive_flow) < period:
+        return None
+        
+    pos_sum = sum(positive_flow[-period:])
+    neg_sum = sum(negative_flow[-period:])
+    
+    if neg_sum == 0:
+        return 100.0
+        
+    mfi_ratio = pos_sum / neg_sum
+    mfi = 100.0 - (100.0 / (1.0 + mfi_ratio))
+    return mfi
+
+
+def parabolic_sar(highs: list[float], lows: list[float], closes: list[float], step: float = 0.02, max_step: float = 0.2) -> dict:
+    """Parabolic SAR."""
+    if len(closes) < 10:
+        return {"sar": None, "trend": "neutral"}
+    
+    sar = [0.0] * len(closes)
+    trend = [1] * len(closes) # 1 bull, -1 bear
+    ep = [0.0] * len(closes)
+    af = [0.0] * len(closes)
+    
+    # Initialize
+    trend[1] = 1 if closes[1] > closes[0] else -1
+    sar[1] = lows[0] if trend[1] == 1 else highs[0]
+    ep[1] = highs[1] if trend[1] == 1 else lows[1]
+    af[1] = step
+    
+    for i in range(2, len(closes)):
+        sar[i] = sar[i-1] + af[i-1] * (ep[i-1] - sar[i-1])
+        
+        if trend[i-1] == 1:
+            if lows[i] < sar[i]:
+                trend[i] = -1
+                sar[i] = ep[i-1]
+                ep[i] = lows[i]
+                af[i] = step
+            else:
+                trend[i] = 1
+                ep[i] = max(ep[i-1], highs[i])
+                af[i] = min(max_step, af[i-1] + step if ep[i] > ep[i-1] else af[i-1])
+        else:
+            if highs[i] > sar[i]:
+                trend[i] = 1
+                sar[i] = ep[i-1]
+                ep[i] = highs[i]
+                af[i] = step
+            else:
+                trend[i] = -1
+                ep[i] = min(ep[i-1], lows[i])
+                af[i] = min(max_step, af[i-1] + step if ep[i] < ep[i-1] else af[i-1])
+                
+    return {"sar": sar[-1], "trend": "bullish" if trend[-1] == 1 else "bearish"}
+
+
+# ---------------------------------------------------------------------------
 # Master-Analyse: Alle Indikatoren auf einmal berechnen
 # ---------------------------------------------------------------------------
 def analyze_all(candles: list[dict], weights: dict = None) -> dict:
@@ -297,10 +444,18 @@ def analyze_all(candles: list[dict], weights: dict = None) -> dict:
     ichi = ichimoku(highs, lows, closes)
     ema_cross = ema_crossover(closes, 9, 21)
     mom = momentum(closes)
-    obv = obv_trend(closes, volumes)
-    pp = pivot_points(highs[-1], lows[-1], closes[-1])
-    sma_20 = _sma(closes, 20)
-    sma_50 = _sma(closes, 50)
+    obv_tr = obv_trend(closes, volumes)
+
+    # Advanced Indicators
+    st = supertrend(highs, lows, closes)
+    kc = keltner_channels(highs, lows, closes)
+    ao = awesome_oscillator(highs, lows)
+    mfi_val = money_flow_index(highs, lows, closes, volumes)
+    psar = parabolic_sar(highs, lows, closes)
+
+    # Pre-compute basic components for AI context
+    ema_9 = _ema(closes, 9)
+    ema_12 = _ema(closes, 12)
     ema_12 = _ema(closes, 12)
 
     # --- Aggregierter Score (-10 bis +10, positiv = BUY, negativ = SELL) ---
@@ -424,12 +579,48 @@ def analyze_all(candles: list[dict], weights: dict = None) -> dict:
 
     # Pivot Points
     piv_w = w.get("pivot", 1.0)
+    pp = pivot_points(highs[-1], lows[-1], closes[-1])
     if closes[-1] > pp["r1"]:
         score += 1 * piv_w; signals["pivot"] = "above_R1_bullish"
     elif closes[-1] < pp["s1"]:
         score -= 1 * piv_w; signals["pivot"] = "below_S1_bearish"
     else:
         signals["pivot"] = "neutral"
+
+    # --- Advanced Indicators Scoring ---
+    
+    # Supertrend
+    st_w = w.get("supertrend", 1.0)
+    if st["trend"] == "bullish":
+        score += 1 * st_w; signals["supertrend"] = "bullish"
+    else:
+        score -= 1 * st_w; signals["supertrend"] = "bearish"
+        
+    # Awesome Oscillator
+    ao_w = w.get("awesome_oscillator", 1.0)
+    if ao["signal"] == "bullish":
+        score += 1 * ao_w; signals["awesome_oscillator"] = "bullish"
+    elif ao["signal"] == "bearish":
+        score -= 1 * ao_w; signals["awesome_oscillator"] = "bearish"
+    else:
+        signals["awesome_oscillator"] = "neutral"
+        
+    # MFI
+    mfi_w = w.get("mfi", 1.0)
+    if mfi_val is not None:
+        if mfi_val < 20:
+            score += 1 * mfi_w; signals["mfi"] = "oversold_BUY"
+        elif mfi_val > 80:
+            score -= 1 * mfi_w; signals["mfi"] = "overbought_SELL"
+        else:
+            signals["mfi"] = "neutral"
+            
+    # Parabolic SAR
+    psar_w = w.get("psar", 1.0)
+    if psar["trend"] == "bullish":
+        score += 1 * psar_w; signals["psar"] = "bullish"
+    else:
+        score -= 1 * psar_w; signals["psar"] = "bearish"
 
     # Score auf int runden für Kompatibilität
     score = int(round(score))
@@ -462,15 +653,16 @@ def analyze_all(candles: list[dict], weights: dict = None) -> dict:
             "adx": {k: round(v, 2) if isinstance(v, float) else v for k, v in adx_val.items()},
             "cci": round(cci_val, 2) if cci_val else None,
             "williams_r": round(wr, 2) if wr else None,
-            "ichimoku": ichi,
-            "ema_cross": ema_cross,
-            "momentum": round(mom, 4) if mom else None,
-            "obv_trend": obv,
-            "pivot_points": {k: round(v, 5) for k, v in pp.items()},
-            "price": closes[-1],
-            "sma_20": round(sma_20[-1], 5) if sma_20[-1] else None,
-            "sma_50": round(sma_50[-1], 5) if sma_50 and sma_50[-1] else None,
-            "ema_12": round(ema_12[-1], 5) if ema_12 else None,
+            "pivot_points": pp,
+            "ema_crossover": ema_cross,
+            "momentum": mom,
+            "obv_trend": obv_tr,
+            "supertrend": st,
+            "keltner_channels": kc,
+            "awesome_oscillator": ao,
+            "mfi": mfi_val,
+            "parabolic_sar": psar,
+            "current_price": closes[-1],
         },
         "sub_signals": signals,
     }

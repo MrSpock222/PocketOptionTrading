@@ -251,6 +251,18 @@ class RiskManager:
         # Persistence
         self.save_path = Path("risk_state.json")
 
+    def reset_session(self, current_balance: float):
+        """Setzt die Streaks und Drawdowns für eine neue Trainings-Session zurück."""
+        self.stats.start_balance = current_balance
+        self.stats.current_balance = current_balance
+        self.stats.peak_balance = current_balance
+        self.stats.current_streak = 0
+        self.stats.current_drawdown_pct = 0.0
+        self.stats.max_drawdown_abs = 0.0
+        self.stats.max_drawdown_pct = 0.0
+        # Optional: Behalte Gesamt-Wins/Losses für Langzeit-Stats,
+        # aber resette die Session-Blocker.
+
     @property
     def strategy(self) -> Strategy:
         return STRATEGIES.get(self.strategy_name, STRATEGIES["soft_martingale"])
@@ -263,7 +275,8 @@ class RiskManager:
         # Safety Caps
         max_amount = balance * 0.10  # Nie mehr als 10% der Balance
         amount = min(amount, max_amount)
-        amount = max(amount, self.base_amount * 0.5)  # Minimum halber Base
+        amount = max(amount, 1.0)  # PocketOption absolutes Minimum ist $1.0
+        amount = max(amount, self.base_amount * 0.5)  # Minimum halber Base (falls Base > 2.0)
         amount = round(amount, 2)
 
         return amount

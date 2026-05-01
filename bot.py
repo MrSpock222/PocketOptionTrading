@@ -172,7 +172,7 @@ class NemoClawClient:
                         else:
                             text = str(data)
                         logger.info("NemoClaw Review-Antwort (%d Zeichen)", len(text))
-                        return self._parse(text)
+                        return self._parse_review(text)
                     except Exception as e:
                         if attempt < 2:
                             logger.warning("Review Versuch %d: %s", attempt + 1, e)
@@ -226,7 +226,7 @@ Letzte Trades: {json.dumps(recent) if recent else 'Keine'}
 AUFGABEN:
 1. Gib deine EIGENE Trade-Prediction ab
 2. Bewerte ob JETZT ein guter Entry ist — BERÜCKSICHTIGE die gelernten Regeln oben!
-3. Passe das Risk Management an wenn nötig (Strategie, Limits, Parameter)
+3. Passe das Risk Management an wenn nötig (Strategie, Limits, Parameter). WICHTIG: Das absolute Einsatz-Minimum (base_amount) ist 1.0$!
 4. Wenn du Muster aus vergangenen Trades erkennst, nutze sie!
 
 ANTWORT NUR ALS JSON:
@@ -261,6 +261,16 @@ ANTWORT NUR ALS JSON:
         if "buy" in lower or "call" in lower:
             return {"prediction": "buy", "confidence": 0.5, "reasoning": "Aus Text extrahiert"}
         return None
+
+    def _parse_review(self, text: str) -> dict:
+        try:
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start != -1 and end > start:
+                return json.loads(text[start:end])
+        except Exception:
+            pass
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -364,173 +374,188 @@ async def trading_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 parse_mode="Markdown",
             )
 
-            state.current_trade = 0
             state.current_amount = state.base_amount
-            state.session_start_balance = balance
             duration = 60
 
-            while state.is_running and state.current_trade < state.max_trades:
-                state.current_trade += 1
+            while state.is_running:
+                state.current_trade = 0
+                state.session_start_balance = balance
+                session_trades = []
 
-                # 1. ALLE OTC-Paare scannen
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🔍 Trade {state.current_trade}/{state.max_trades} — Scanne alle OTC-Paare...",
-                )
-                scan_results = await scanner.scan_all(client, weights=state.memory.get_weights())
-                scan_summary = scanner.format_scan_summary(scan_results)
-                await context.bot.send_message(chat_id=chat_id, text=scan_summary, parse_mode="Markdown")
+                while state.is_running and state.current_trade < state.max_trades:
 
-                # 2. Besten Entry finden
-                best = scanner.find_best_entry(scan_results)
-                if not best:
+                    # 1. ALLE OTC-Paare scannen
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text="⏳ Kein klarer Entry — warte 30s und scanne erneut...",
+                        text=f"🔍 Trade {state.current_trade + 1}/{state.max_trades} — Scanne alle OTC-Paare...",
                     )
-                    await asyncio.sleep(30)
-                    continue
+                    scan_results = await scanner.scan_all(client, weights=state.memory.get_weights())
+                    scan_summary = scanner.format_scan_summary(scan_results)
+                    await context.bot.send_message(chat_id=chat_id, text=scan_summary, parse_mode="Markdown")
 
-                # 3. NemoClaw KI fragen — mit Risk-State
-                current_balance = await client.balance()
-                risk_state = state.risk.get_state_for_ai()
-                ai_response = await state.nemoclaw.analyze(
-                    best, scan_results, state.history, current_balance, risk_state
-                )
-
-                # KI Risk-Anpassungen anwenden
-                if ai_response and ai_response.get("risk_adjustments"):
-                    changes = state.risk.apply_ai_adjustments(ai_response["risk_adjustments"])
-                    if changes:
+                    # 2. Besten Entry finden
+                    best = scanner.find_best_entry(scan_results)
+                    if not best:
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text=f"🔧 *KI Risk-Anpassung:*\n" + "\n".join(f"  • {_esc_md(c)}" for c in changes),
+                            text="⏳ Kein klarer Entry — warte 30s und scanne erneut...",
+                        )
+                        await asyncio.sleep(30)
+                        continue
+
+                    # 3. NemoClaw KI fragen — mit Risk-State
+                    current_balance = await client.balance()
+                    risk_state = state.risk.get_state_for_ai()
+                    ai_response = await state.nemoclaw.analyze(
+                        best, scan_results, state.history, current_balance, risk_state
+                    )
+
+                    # KI Risk-Anpassungen anwenden
+                    if ai_response and ai_response.get("risk_adjustments"):
+                        changes = state.risk.apply_ai_adjustments(ai_response["risk_adjustments"])
+                        if changes:
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"🔧 *KI Risk-Anpassung:*\n" + "\n".join(f"  • {_esc_md(c)}" for c in changes),
+                                parse_mode="Markdown",
+                            )
+
+                    # KI kann ein anderes Asset vorschlagen
+                    asset = best["asset"]
+                    if ai_response and ai_response.get("preferred_asset"):
+                        preferred = ai_response["preferred_asset"]
+                        # Prüfe ob das vorgeschlagene Asset in den Scan-Ergebnissen ist
+                        for r in scan_results:
+                            if r["asset"] == preferred:
+                                asset = preferred
+                                best = r
+                                break
+
+                    # 4. Prediction kombinieren
+                    action, confidence, reasoning = build_prediction(best, ai_response)
+
+                    # Risk Check: Darf getradet werden?
+                    can_trade, risk_reason = state.risk.should_trade(confidence, current_balance)
+                    if not can_trade:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"🛑 *Trade blockiert:* {risk_reason}",
                             parse_mode="Markdown",
                         )
-
-                # KI kann ein anderes Asset vorschlagen
-                asset = best["asset"]
-                if ai_response and ai_response.get("preferred_asset"):
-                    preferred = ai_response["preferred_asset"]
-                    # Prüfe ob das vorgeschlagene Asset in den Scan-Ergebnissen ist
-                    for r in scan_results:
-                        if r["asset"] == preferred:
-                            asset = preferred
-                            best = r
+                        if "Drawdown" in risk_reason or "Verlustlimit" in risk_reason or "Verlustserie" in risk_reason:
+                            # Wir stoppen den Bot nicht komplett, sondern beenden nur die aktuelle Session frühzeitig
+                            # um eine KI-Analyse zu erzwingen und danach weiter zu lernen!
                             break
+                        await asyncio.sleep(15)
+                        continue
 
-                # 4. Prediction kombinieren
-                action, confidence, reasoning = build_prediction(best, ai_response)
+                    # Einsatz vom Risk Manager berechnen
+                    trade_amount = state.risk.get_next_amount(state.history, current_balance)
+                    state.current_trade += 1
 
-                # Risk Check: Darf getradet werden?
-                can_trade, risk_reason = state.risk.should_trade(confidence, current_balance)
-                if not can_trade:
+                    ind = best.get("indicators", {})
+                    subs = best.get("sub_signals", {})
+                    buy_n = sum(1 for v in subs.values() if "BUY" in str(v) or "bullish" in str(v))
+                    sell_n = sum(1 for v in subs.values() if "SELL" in str(v) or "bearish" in str(v))
+
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=f"🛑 *Trade blockiert:* {risk_reason}",
+                        text=(
+                            f"🎯 *{_esc_md(asset)}* → *{action.upper()}*\n"
+                            f"Konfidenz: {confidence:.0%} | Score: {best.get('score', 0)}\n"
+                            f"💡 {_esc_md(reasoning)}\n"
+                            f"💵 Einsatz: ${trade_amount:.2f} ({_esc_md(state.risk.strategy_name)})\n"
+                            f"RSI:{ind.get('rsi_14','?')} BB:{ind.get('bollinger',{}).get('percent_b','?')}"
+                        ),
                         parse_mode="Markdown",
                     )
-                    if "Drawdown" in risk_reason or "Verlustlimit" in risk_reason:
-                        state.is_running = False
-                        break
-                    await asyncio.sleep(15)
-                    continue
 
-                # Einsatz vom Risk Manager berechnen
-                trade_amount = state.risk.get_next_amount(state.history, current_balance)
+                    # 5. Trade ausführen
+                    try:
+                        if action == "buy":
+                            trade_id, deal = await client.buy(
+                                asset=asset, amount=trade_amount, time=duration, check_win=False
+                            )
+                        else:
+                            trade_id, deal = await client.sell(
+                                asset=asset, amount=trade_amount, time=duration, check_win=False
+                            )
+                    except Exception as e:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"⚠️ *Trade fehlgeschlagen:* `{_esc_md(str(e))}`\nGehe zum nächsten Scan...",
+                            parse_mode="Markdown",
+                        )
+                        state.current_trade -= 1  # Trade wurde nicht ausgeführt
+                        await asyncio.sleep(5)
+                        continue
 
-                ind = best.get("indicators", {})
-                subs = best.get("sub_signals", {})
-                buy_n = sum(1 for v in subs.values() if "BUY" in str(v) or "bullish" in str(v))
-                sell_n = sum(1 for v in subs.values() if "SELL" in str(v) or "bearish" in str(v))
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"🎯 *{_esc_md(asset)}* → *{action.upper()}*\n"
-                        f"Konfidenz: {confidence:.0%} | Score: {best.get('score', 0)}\n"
-                        f"💡 {_esc_md(reasoning)}\n"
-                        f"💵 Einsatz: ${trade_amount:.2f} ({_esc_md(state.risk.strategy_name)})\n"
-                        f"RSI:{ind.get('rsi_14','?')} BB:{ind.get('bollinger',{}).get('percent_b','?')}"
-                    ),
-                    parse_mode="Markdown",
-                )
-
-                # 5. Trade ausführen
-                if action == "buy":
-                    trade_id, deal = await client.buy(
-                        asset=asset, amount=trade_amount, time=duration, check_win=False
-                    )
-                else:
-                    trade_id, deal = await client.sell(
-                        asset=asset, amount=trade_amount, time=duration, check_win=False
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"⏱ `{_esc_md(asset)}` {action.upper()} ${trade_amount:.2f} — warte {duration}s...",
+                        parse_mode="Markdown",
                     )
 
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"⏱ `{_esc_md(asset)}` {action.upper()} ${trade_amount:.2f} — warte {duration}s...",
-                    parse_mode="Markdown",
-                )
-
-                # 6. Ergebnis
-                result = await client.check_win(trade_id)
-                status = "loss"
-                if isinstance(result, dict):
-                    # check_win gibt {'result': 'win'/'loss', 'profit': ...} zurück
-                    res_str = str(result.get("result", "")).lower()
-                    if "win" in res_str:
+                    # 6. Ergebnis
+                    result = await client.check_win(trade_id)
+                    status = "loss"
+                    if isinstance(result, dict):
+                        # check_win gibt {'result': 'win'/'loss', 'profit': ...} zurück
+                        res_str = str(result.get("result", "")).lower()
+                        if "win" in res_str:
+                            status = "win"
+                        else:
+                            try:
+                                profit = float(result.get("profit", 0))
+                                if profit > 0:
+                                    status = "win"
+                            except (ValueError, TypeError):
+                                pass
+                    elif "win" in str(result).lower():
                         status = "win"
+
+                    new_bal = await client.balance()
+                    state.risk.record_result(trade_amount, status, new_bal)
+
+                    trade_entry = {
+                        "trade_number": state.current_trade,
+                        "trade_id": str(trade_id),
+                        "asset": asset,
+                        "amount": trade_amount,
+                        "action": action,
+                        "status": status,
+                        "confidence": confidence,
+                        "score": best.get("score", 0),
+                        "strategy": state.risk.strategy_name,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    state.history.append(trade_entry)
+                    session_trades.append(trade_entry)
+
+                    # AI Memory: Trade mit vollem Kontext loggen
+                    state.memory.log_trade(
+                        trade_data=trade_entry,
+                        indicators=best.get("indicators", {}),
+                        ai_response=ai_response,
+                        scan_results=scan_results,
+                        final_action=action,
+                        confidence=confidence,
+                        reasoning=reasoning,
+                        balance_before=current_balance,
+                        balance_after=new_bal,
+                    )
+
+                    # 7. Ergebnis-Meldung
+                    if status == "loss":
+                        next_amt = state.risk.get_next_amount(state.history, new_bal)
+                        msg = f"❌ *VERLUST* | Nächster: ${next_amt:.2f} ({_esc_md(state.risk.strategy_name)})"
                     else:
-                        try:
-                            profit = float(result.get("profit", 0))
-                            if profit > 0:
-                                status = "win"
-                        except (ValueError, TypeError):
-                            pass
-                elif "win" in str(result).lower():
-                    status = "win"
+                        next_amt = state.risk.get_next_amount(state.history, new_bal)
+                        msg = f"✅ *GEWINN* | Nächster: ${next_amt:.2f}"
 
-                new_bal = await client.balance()
-                state.risk.record_result(trade_amount, status, new_bal)
-
-                trade_entry = {
-                    "trade_number": state.current_trade,
-                    "trade_id": str(trade_id),
-                    "asset": asset,
-                    "amount": trade_amount,
-                    "action": action,
-                    "status": status,
-                    "confidence": confidence,
-                    "score": best.get("score", 0),
-                    "strategy": state.risk.strategy_name,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                }
-                state.history.append(trade_entry)
-
-                # AI Memory: Trade mit vollem Kontext loggen
-                state.memory.log_trade(
-                    trade_data=trade_entry,
-                    indicators=best.get("indicators", {}),
-                    ai_response=ai_response,
-                    scan_results=scan_results,
-                    final_action=action,
-                    confidence=confidence,
-                    reasoning=reasoning,
-                    balance_before=current_balance,
-                    balance_after=new_bal,
-                )
-
-                # 7. Ergebnis-Meldung
-                if status == "loss":
-                    next_amt = state.risk.get_next_amount(state.history, new_bal)
-                    msg = f"❌ *VERLUST* | Nächster: ${next_amt:.2f} ({_esc_md(state.risk.strategy_name)})"
-                else:
-                    next_amt = state.risk.get_next_amount(state.history, new_bal)
-                    msg = f"✅ *GEWINN* | Nächster: ${next_amt:.2f}"
-
-                dd = state.risk.stats.current_drawdown_pct
-                await context.bot.send_message(
-                    chat_id=chat_id,
+                    dd = state.risk.stats.current_drawdown_pct
+                    await context.bot.send_message(
+                        chat_id=chat_id,
                     text=f"{msg}\n💰 ${new_bal} | DD: {dd:.1f}%",
                     parse_mode="Markdown",
                 )
@@ -538,78 +563,87 @@ async def trading_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 state.risk.save_state()
                 await asyncio.sleep(2)
 
-                # Continuous Mode: Im Demo-Modus weitertraden
-                if state.continuous and state.current_trade >= state.max_trades:
-                    state.current_trade = 0
-                    logger.info("Continuous-Modus: Nächste 10 Trades...")
+                await asyncio.sleep(2)
 
-            # Session-Ende
-            if state.is_running:
-                final = await client.balance()
-                summary = state.risk.stats.to_summary()
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"🏁 *Session beendet!*\n\n"
-                        f"{_esc_md(summary)}\n"
-                        f"💰 Balance: ${final}"
-                    ),
-                    parse_mode="Markdown",
-                )
-                state.risk.save_state()
-
-                # ====================================================
-                # POST-SESSION AI REVIEW — Selbstlernende KI-Analyse
-                # ====================================================
-                if state.history and len(state.history) >= 2:
+                # Session-Ende / Post-Session Analysis
+                if state.is_running:
+                    final = await client.balance()
+                    summary = state.risk.stats.to_summary()
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text="🧠 *KI analysiert die Session...*\nLerne aus Gewinnen und Fehlern...",
+                        text=(
+                            f"🏁 *Session beendet!*\n\n"
+                            f"{_esc_md(summary)}\n"
+                            f"💰 Balance: ${final}"
+                        ),
                         parse_mode="Markdown",
                     )
-                    try:
-                        review_prompt = state.memory.build_review_prompt(
-                            state.history, state.session_start_balance, final
-                        )
-                        review_response = await state.nemoclaw.analyze_raw(review_prompt)
-                        if review_response:
-                            changes = state.memory.apply_review(review_response, state.history)
-                            learnings = review_response.get("key_learnings", [])
-                            rules_count = len(review_response.get("new_rules", []))
+                    state.risk.save_state()
 
-                            review_msg = f"🧠 *Post-Session Analyse:*\n"
-                            review_msg += f"{_esc_md(review_response.get('session_summary', 'Keine Zusammenfassung'))}\n\n"
-
-                            if learnings:
-                                review_msg += "📝 *Gelernt:*\n"
-                                for l in learnings[:5]:
-                                    review_msg += f"  • {_esc_md(l)}\n"
-
-                            if changes:
-                                review_msg += f"\n⚖️ *Gewichte angepasst:*\n"
-                                for c in changes:
-                                    review_msg += f"  • {_esc_md(c)}\n"
-
-                            if rules_count > 0:
-                                review_msg += f"\n📌 {rules_count} neue Regeln gespeichert"
-
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=review_msg,
-                                parse_mode="Markdown",
-                            )
-                        else:
-                            logger.warning("Post-Session Review: Keine Antwort von NemoClaw")
-                    except Exception as e:
-                        logger.error("Post-Session Review Fehler: %s", e)
+                    # ====================================================
+                    # POST-SESSION AI REVIEW — Selbstlernende KI-Analyse
+                    # ====================================================
+                    if session_trades and len(session_trades) >= 2:
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text=f"⚠️ Review-Analyse fehlgeschlagen: `{_esc_md(e)}`",
+                            text="🧠 *KI analysiert die Session...*\nLerne aus Gewinnen und Fehlern...",
                             parse_mode="Markdown",
                         )
+                        try:
+                            review_prompt = state.memory.build_review_prompt(
+                                session_trades, state.session_start_balance, final
+                            )
+                            review_response = await state.nemoclaw.analyze_raw(review_prompt)
+                            if review_response:
+                                changes = state.memory.apply_review(review_response, session_trades)
+                                learnings = review_response.get("key_learnings", [])
+                                rules_count = len(review_response.get("new_rules", []))
 
-                state.memory.save()
-                state.is_running = False
+                                review_msg = f"🧠 *Post-Session Analyse:*\n"
+                                review_msg += f"{_esc_md(review_response.get('session_summary', 'Keine Zusammenfassung'))}\n\n"
+
+                                if learnings:
+                                    review_msg += "📝 *Gelernt:*\n"
+                                    for l in learnings[:5]:
+                                        review_msg += f"  • {_esc_md(l)}\n"
+
+                                if changes:
+                                    review_msg += f"\n⚖️ *Gewichte angepasst:*\n"
+                                    for c in changes:
+                                        review_msg += f"  • {_esc_md(c)}\n"
+
+                                if rules_count > 0:
+                                    review_msg += f"\n📌 {rules_count} neue Regeln gespeichert"
+
+                                await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=review_msg,
+                                    parse_mode="Markdown",
+                                )
+                            else:
+                                logger.warning("Post-Session Review: Keine Antwort von NemoClaw")
+                        except Exception as e:
+                            logger.error("Post-Session Review Fehler: %s", e)
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"⚠️ Review-Analyse fehlgeschlagen: `{_esc_md(e)}`",
+                                parse_mode="Markdown",
+                            )
+
+                    state.memory.save()
+                    
+                    if state.continuous and state.is_running:
+                        balance = final
+                        # Risikoparameter für nächste Session zurücksetzen (Streaks, Drawdowns)
+                        state.risk.reset_session(balance)
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text="🔄 *Continuous Mode: Starte nächste Session in 5s...*",
+                            parse_mode="Markdown",
+                        )
+                        await asyncio.sleep(5)
+                    else:
+                        state.is_running = False
 
     except Exception as e:
         logger.error(f"Trading error: {e}", exc_info=True)
@@ -625,7 +659,7 @@ async def trading_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 # Telegram Commands
 # ---------------------------------------------------------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [["/start_bot", "/stop_bot"], ["/demo", "/real"], ["/status", "/balance"], ["/risk", "/memory"], ["/continuous"]]
+    kb = [["/start_bot", "/stop_bot"], ["/demo", "/real"], ["/status", "/stats"], ["/risk", "/memory"], ["/continuous", "/balance"]]
     await update.message.reply_text(
         "🤖 *PocketOption AI Scalping Bot*\n"
         f"NemoClaw KI + 15 Indikatoren + {len(scanner.OTC_ASSETS)} OTC-Paare\n\n"
@@ -770,6 +804,10 @@ async def memory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = state.memory.get_rules_summary()
     await update.message.reply_text(summary, parse_mode="Markdown")
 
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Zeigt globale Statistiken."""
+    summary = state.memory.get_stats_summary()
+    await update.message.reply_text(summary, parse_mode="Markdown")
 
 def main():
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -787,6 +825,7 @@ def main():
     app.add_handler(CommandHandler("continuous", continuous_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("memory", memory_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
     logger.info("Bot startet...")
     app.run_polling()
 

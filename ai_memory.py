@@ -474,4 +474,80 @@ ANTWORT NUR ALS JSON:
             lines.append(f"  {last.get('summary', 'Keine')[:120]}")
 
         return "\n".join(lines) if len(lines) > 1 else "🧠 Noch keine Daten — starte eine Trading-Session!"
-"""
+
+    # ------------------------------------------------------------------
+    # Globale Statistiken für Telegram /stats
+    # ------------------------------------------------------------------
+    def get_stats_summary(self) -> str:
+        """Berechnet detaillierte Statistiken über alle Trades."""
+        trades = self.data.get("trade_log", [])
+        if not trades:
+            return "📊 Noch keine Trades vorhanden."
+
+        total_trades = len(trades)
+        wins = sum(1 for t in trades if t.get("status") == "win")
+        losses = sum(1 for t in trades if t.get("status") == "loss")
+        wr = wins / total_trades if total_trades > 0 else 0
+
+        # PnL berechnen
+        total_profit = sum(t.get("profit", 0) for t in trades)
+        
+        # Max Drawdown & Peak Balance (Simuliert von Start 0.0)
+        current_bal = 0.0
+        peak_bal = 0.0
+        max_dd = 0.0
+        
+        # Streaks
+        current_streak = 0
+        best_streak = 0
+        worst_streak = 0
+        last_status = None
+
+        for t in trades:
+            profit = t.get("profit", 0)
+            current_bal += profit
+            
+            if current_bal > peak_bal:
+                peak_bal = current_bal
+                
+            dd = peak_bal - current_bal
+            if dd > max_dd:
+                max_dd = dd
+                
+            status = t.get("status")
+            if status == last_status:
+                current_streak += 1 if status == "win" else -1
+            else:
+                current_streak = 1 if status == "win" else -1
+                
+            if current_streak > best_streak:
+                best_streak = current_streak
+            if current_streak < worst_streak:
+                worst_streak = current_streak
+                
+            last_status = status
+
+        lines = [
+            "📈 *Globale Performance Statistiken*",
+            "",
+            f"🎯 *Gesamt-Trades:* {total_trades}",
+            f"✅ Wins: {wins} | ❌ Losses: {losses}",
+            f"📊 Win Rate: {wr:.1%}",
+            "",
+            f"💰 *Gesamt Profit:* ${total_profit:+.2f}",
+            f"📉 Max Drawdown (Total): ${max_dd:.2f}",
+            "",
+            f"🔥 Best Streak: {best_streak} Wins in Folge",
+            f"🧊 Worst Streak: {abs(worst_streak)} Losses in Folge",
+        ]
+
+        # Letzte 3 Sessions
+        reviews = self.data.get("session_reviews", [])
+        if reviews:
+            lines.append("")
+            lines.append("📋 *Letzte 3 Sessions:*")
+            for i, r in enumerate(reviews[-3:], 1):
+                t_count = r.get("trades", 0)
+                lines.append(f"  {i}. Session: {t_count} Trades | {r.get('timestamp', '')[:10]}")
+                
+        return "\n".join(lines)
