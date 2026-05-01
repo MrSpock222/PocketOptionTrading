@@ -82,14 +82,14 @@ async def get_candles(client, asset: str, count: int = 60) -> list[dict]:
     return []
 
 
-async def scan_single(client, asset: str) -> dict | None:
+async def scan_single(client, asset: str, weights: dict = None) -> dict | None:
     """Scannt ein einzelnes Asset und berechnet Indikatoren."""
     candles = await get_candles(client, asset)
     if len(candles) < 20:
         logger.info(f"{asset}: Nur {len(candles)} Candles — übersprungen")
         return None
     try:
-        analysis = indicators.analyze_all(candles)
+        analysis = indicators.analyze_all(candles, weights=weights)
         return {
             "asset": asset,
             "signal": analysis["signal"],
@@ -103,7 +103,7 @@ async def scan_single(client, asset: str) -> dict | None:
         return None
 
 
-async def scan_all(client, max_concurrent: int = 5) -> list[dict]:
+async def scan_all(client, max_concurrent: int = 5, weights: dict = None) -> list[dict]:
     """
     Scannt ALLE OTC-Paare parallel und gibt eine nach Score sortierte
     Liste zurück.
@@ -112,7 +112,7 @@ async def scan_all(client, max_concurrent: int = 5) -> list[dict]:
 
     async def limited_scan(asset):
         async with sem:
-            return await scan_single(client, asset)
+            return await scan_single(client, asset, weights=weights)
 
     tasks = [limited_scan(a) for a in OTC_ASSETS]
     results = await asyncio.gather(*tasks, return_exceptions=True)

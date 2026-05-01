@@ -78,6 +78,10 @@ DEFAULT_MODEL = os.getenv("NEMOCLAW_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 INFERENCE_URL = "https://inference.local/v1/chat/completions"
 
 
+# Semaphore: Nur EINE nemoclaw-Session gleichzeitig (verhindert Session-Aufstau)
+_inference_lock = asyncio.Semaphore(1)
+
+
 # ---------------------------------------------------------------------------
 # NemoClaw Sandbox Inference Call
 # ---------------------------------------------------------------------------
@@ -87,10 +91,54 @@ async def call_inference(messages: list[dict], model: str = "",
     Sendet Request an den NVIDIA Inference Server DURCH die NemoClaw Sandbox.
 
     Methode: Piped curl durch `nemoclaw <sandbox> connect`
-    - Base64-kodiert den Payload (vermeidet Escaping-Probleme)
-    - Dekodiert in der Sandbox und piped an curl
-    - Parst die JSON-Antwort aus dem Output
+    - Serialisiert (nur eine Session gleichzeitig)
+    - Killt alte Sessions VOR jedem neuen Call
+    - Hard-Timeout über Linux `timeout` Befehl
     """
+    async with _inference_lock:
+        return await _do_inference(messages, model, temperature)
+
+async def _cleanup_nemoclaw():
+    """Killt hängende Sandbox-Connect-Prozesse vor einem neuen Call.
+
+    Verwendet erst SIGTERM (graceful), dann SIGKILL als Fallback.
+    Spezifische Patterns um System-Prozesse nicht zu treffen.
+    """
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            # Erst sanft beenden (SIGTERM):
+            "pkill -f 'openshell sandbox connect' 2>/dev/null; "
+            "pkill -f 'openshell ssh-proxy' 2>/dev/null; "
+            "pkill -f 'nemoclaw.*connect' 2>/dev/null; "
+            # Kurz warten ob sie von selbst beenden:
+            "sleep 2; "
+            # Dann hart killen falls noch da (SIGKILL):
+            "pkill -9 -f 'openshell sandbox connect' 2>/dev/null; "
+            "pkill -9 -f 'openshell ssh-proxy' 2>/dev/null; "
+            "pkill -9 -f 'nemoclaw.*connect' 2>/dev/null; "
+            "sleep 1",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=15)
+    except Exception:
+        pass
+    # Warte bis Sandbox die Sessions wirklich freigegeben hat
+    await asyncio.sleep(2)
+    logger.info("Cleanup: alte sandbox connect Prozesse beendet")
+
+
+async def _do_inference(messages: list[dict], model: str,
+                        temperature: float) -> dict:
+    """Interne Inference-Logik — wird durch Semaphore serialisiert.
+
+    Schreibt den Befehl in ein temporäres Bash-Script und führt es aus.
+    Das vermeidet TTY-Probleme die beim Pipen in Background-Prozessen auftreten.
+    """
+
+    # SCHRITT 1: Alte Sessions aufräumen
+    await _cleanup_nemoclaw()
+
     payload = json.dumps({
         "model": model or DEFAULT_MODEL,
         "messages": messages,
@@ -100,38 +148,59 @@ async def call_inference(messages: list[dict], model: str = "",
     # Base64-Encoding verhindert Escaping-Probleme mit Quotes/Sonderzeichen
     payload_b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
 
-    # Sandbox-Befehl: Base64 dekodieren → an curl pipen
-    sandbox_cmd = (
-        f"echo '{payload_b64}' | base64 -d | "
-        f"curl -sk {INFERENCE_URL} "
-        f"-X POST -H 'Content-Type: application/json' -d @- "
-        f"2>/dev/null && exit"
-    )
+    # Temporäres Script erstellen — vermeidet alle Quoting/TTY-Probleme
+    script_path = f"/tmp/nemoclaw_inference_{uuid.uuid4().hex[:8]}.sh"
+    script_content = f"""#!/bin/bash
+echo '{payload_b64}' | base64 -d | \\
+  curl -sk {INFERENCE_URL} \\
+  -X POST -H 'Content-Type: application/json' -d @- \\
+  2>/dev/null
+exit
+"""
+    with open(script_path, "w") as f:
+        f.write(script_content)
+    os.chmod(script_path, 0o755)
 
-    # Durch nemoclaw connect pipen
-    shell_cmd = f"echo {_shell_quote(sandbox_cmd)} | nemoclaw {SANDBOX_NAME} connect"
+    # Genau wie der manuelle Test der funktioniert:
+    # echo "cmd ; exit" | nemoclaw money connect
+    shell_cmd = f'cat {script_path} | nemoclaw {SANDBOX_NAME} connect'
 
     logger.info("Sende Request an Inference Server (model=%s, %d messages)", model or DEFAULT_MODEL, len(messages))
 
+    proc = None
+    stdout = b""
+    stderr = b""
     try:
         proc = await asyncio.create_subprocess_shell(
             shell_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=CLI_TIMEOUT
         )
     except asyncio.TimeoutError:
         logger.error("Timeout nach %ds", CLI_TIMEOUT)
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        await _kill_proc(proc)
+        await _cleanup_nemoclaw()
         raise RuntimeError(f"NemoClaw Sandbox Timeout nach {CLI_TIMEOUT}s")
     except Exception as e:
         logger.error("Subprocess-Fehler: %s", e)
+        await _kill_proc(proc)
+        await _cleanup_nemoclaw()
         raise RuntimeError(f"NemoClaw Subprocess-Fehler: {e}")
+    finally:
+        # Script aufräumen
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+
+    # Erfolgreicher Call — Grace Period für Sandbox
+    await _kill_proc(proc)
+    await asyncio.sleep(5)
 
     output = stdout.decode("utf-8", errors="replace")
 
@@ -148,6 +217,18 @@ async def call_inference(messages: list[dict], model: str = "",
 
     logger.info("Inference-Antwort erhalten (%d Zeichen)", len(json.dumps(result)))
     return result
+
+
+async def _kill_proc(proc):
+    """Beendet einen Subprocess sicher."""
+    if proc is None:
+        return
+    try:
+        if proc.returncode is None:
+            proc.kill()
+            await asyncio.wait_for(proc.wait(), timeout=5)
+    except Exception:
+        pass
 
 
 def _shell_quote(s: str) -> str:

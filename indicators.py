@@ -259,15 +259,24 @@ def obv_trend(closes: list[float], volumes: list[float], period: int = 10) -> Op
 # ---------------------------------------------------------------------------
 # Master-Analyse: Alle Indikatoren auf einmal berechnen
 # ---------------------------------------------------------------------------
-def analyze_all(candles: list[dict]) -> dict:
+def analyze_all(candles: list[dict], weights: dict = None) -> dict:
     """
     Berechnet ALLE Indikatoren aus einer Liste von Candle-Dicts.
     Erwartet: [{"open": .., "high": .., "low": .., "close": .., "volume": ..}, ...]
+    
+    Args:
+        candles: Liste von Candle-Dicts
+        weights: Optionale Indikator-Gewichte aus dem AI Memory System.
+                 Jeder Wert multipliziert den Score-Beitrag des jeweiligen Indikators.
+                 Default: 1.0 für alle.
     
     Returns: Dict mit allen Indikator-Werten + einem aggregierten Score.
     """
     if len(candles) < 2:
         return {"error": "Zu wenige Candles", "score": 0, "signal": "neutral"}
+
+    # Gewichte laden (Default: alles 1.0)
+    w = weights or {}
 
     opens = [c.get("open", c.get("o", 0)) for c in candles]
     highs = [c.get("high", c.get("h", 0)) for c in candles]
@@ -295,120 +304,135 @@ def analyze_all(candles: list[dict]) -> dict:
     ema_12 = _ema(closes, 12)
 
     # --- Aggregierter Score (-10 bis +10, positiv = BUY, negativ = SELL) ---
-    score = 0
+    # Gewichte beeinflussen wie stark jeder Indikator den Score beeinflusst
+    score = 0.0
     signals = {}
 
     # RSI
+    rsi_w = w.get("rsi", 1.0)
     if rsi_val is not None:
         if rsi_val < 30:
-            score += 2; signals["rsi"] = "oversold_BUY"
+            score += 2 * rsi_w; signals["rsi"] = "oversold_BUY"
         elif rsi_val < 40:
-            score += 1; signals["rsi"] = "low_BUY"
+            score += 1 * rsi_w; signals["rsi"] = "low_BUY"
         elif rsi_val > 70:
-            score -= 2; signals["rsi"] = "overbought_SELL"
+            score -= 2 * rsi_w; signals["rsi"] = "overbought_SELL"
         elif rsi_val > 60:
-            score -= 1; signals["rsi"] = "high_SELL"
+            score -= 1 * rsi_w; signals["rsi"] = "high_SELL"
         else:
             signals["rsi"] = "neutral"
 
     # MACD
+    macd_w = w.get("macd", 1.0)
     if macd_val["histogram"] is not None:
         if macd_val["histogram"] > 0 and macd_val["macd_line"] > macd_val["signal_line"]:
-            score += 2; signals["macd"] = "bullish"
+            score += 2 * macd_w; signals["macd"] = "bullish"
         elif macd_val["histogram"] < 0 and macd_val["macd_line"] < macd_val["signal_line"]:
-            score -= 2; signals["macd"] = "bearish"
+            score -= 2 * macd_w; signals["macd"] = "bearish"
         else:
             signals["macd"] = "neutral"
 
     # Bollinger Bands
+    bb_w = w.get("bollinger", 1.0)
     if bb["percent_b"] is not None:
         if bb["percent_b"] < 0.1:
-            score += 2; signals["bb"] = "below_lower_BUY"
+            score += 2 * bb_w; signals["bb"] = "below_lower_BUY"
         elif bb["percent_b"] < 0.3:
-            score += 1; signals["bb"] = "near_lower_BUY"
+            score += 1 * bb_w; signals["bb"] = "near_lower_BUY"
         elif bb["percent_b"] > 0.9:
-            score -= 2; signals["bb"] = "above_upper_SELL"
+            score -= 2 * bb_w; signals["bb"] = "above_upper_SELL"
         elif bb["percent_b"] > 0.7:
-            score -= 1; signals["bb"] = "near_upper_SELL"
+            score -= 1 * bb_w; signals["bb"] = "near_upper_SELL"
         else:
             signals["bb"] = "neutral"
 
     # Stochastic
+    stoch_w = w.get("stochastic", 1.0)
     if stoch["k"] is not None and stoch["d"] is not None:
         if stoch["k"] < 20 and stoch["k"] > stoch["d"]:
-            score += 2; signals["stoch"] = "oversold_cross_BUY"
+            score += 2 * stoch_w; signals["stoch"] = "oversold_cross_BUY"
         elif stoch["k"] < 20:
-            score += 1; signals["stoch"] = "oversold_BUY"
+            score += 1 * stoch_w; signals["stoch"] = "oversold_BUY"
         elif stoch["k"] > 80 and stoch["k"] < stoch["d"]:
-            score -= 2; signals["stoch"] = "overbought_cross_SELL"
+            score -= 2 * stoch_w; signals["stoch"] = "overbought_cross_SELL"
         elif stoch["k"] > 80:
-            score -= 1; signals["stoch"] = "overbought_SELL"
+            score -= 1 * stoch_w; signals["stoch"] = "overbought_SELL"
         else:
             signals["stoch"] = "neutral"
 
     # ADX + DI
+    adx_w = w.get("adx", 1.0)
     if adx_val["adx"] is not None:
         if adx_val["adx"] > 25:
             if adx_val["di_plus"] > adx_val["di_minus"]:
-                score += 1; signals["adx"] = "strong_trend_BUY"
+                score += 1 * adx_w; signals["adx"] = "strong_trend_BUY"
             else:
-                score -= 1; signals["adx"] = "strong_trend_SELL"
+                score -= 1 * adx_w; signals["adx"] = "strong_trend_SELL"
         else:
             signals["adx"] = "weak_trend"
 
     # CCI
+    cci_w = w.get("cci", 1.0)
     if cci_val is not None:
         if cci_val < -100:
-            score += 1; signals["cci"] = "oversold_BUY"
+            score += 1 * cci_w; signals["cci"] = "oversold_BUY"
         elif cci_val > 100:
-            score -= 1; signals["cci"] = "overbought_SELL"
+            score -= 1 * cci_w; signals["cci"] = "overbought_SELL"
         else:
             signals["cci"] = "neutral"
 
     # Williams %R
+    wr_w = w.get("williams_r", 1.0)
     if wr is not None:
         if wr < -80:
-            score += 1; signals["williams_r"] = "oversold_BUY"
+            score += 1 * wr_w; signals["williams_r"] = "oversold_BUY"
         elif wr > -20:
-            score -= 1; signals["williams_r"] = "overbought_SELL"
+            score -= 1 * wr_w; signals["williams_r"] = "overbought_SELL"
         else:
             signals["williams_r"] = "neutral"
 
     # Ichimoku
+    ichi_w = w.get("ichimoku", 1.0)
     if ichi["signal"] == "bullish":
-        score += 1; signals["ichimoku"] = "bullish"
+        score += 1 * ichi_w; signals["ichimoku"] = "bullish"
     elif ichi["signal"] == "bearish":
-        score -= 1; signals["ichimoku"] = "bearish"
+        score -= 1 * ichi_w; signals["ichimoku"] = "bearish"
     else:
         signals["ichimoku"] = "neutral"
 
     # EMA Crossover
+    ema_w = w.get("ema_cross", 1.0)
     if "cross" in ema_cross["signal"]:
         if "bullish" in ema_cross["signal"]:
-            score += 2; signals["ema_cross"] = "bullish_cross"
+            score += 2 * ema_w; signals["ema_cross"] = "bullish_cross"
         else:
-            score -= 2; signals["ema_cross"] = "bearish_cross"
+            score -= 2 * ema_w; signals["ema_cross"] = "bearish_cross"
     elif ema_cross["signal"] == "bullish":
-        score += 1; signals["ema_cross"] = "bullish"
+        score += 1 * ema_w; signals["ema_cross"] = "bullish"
     elif ema_cross["signal"] == "bearish":
-        score -= 1; signals["ema_cross"] = "bearish"
+        score -= 1 * ema_w; signals["ema_cross"] = "bearish"
 
     # Momentum
+    mom_w = w.get("momentum", 1.0)
     if mom is not None:
         if mom > 0.1:
-            score += 1; signals["momentum"] = "positive"
+            score += 1 * mom_w; signals["momentum"] = "positive"
         elif mom < -0.1:
-            score -= 1; signals["momentum"] = "negative"
+            score -= 1 * mom_w; signals["momentum"] = "negative"
         else:
             signals["momentum"] = "neutral"
 
     # Pivot Points
+    piv_w = w.get("pivot", 1.0)
     if closes[-1] > pp["r1"]:
-        score += 1; signals["pivot"] = "above_R1_bullish"
+        score += 1 * piv_w; signals["pivot"] = "above_R1_bullish"
     elif closes[-1] < pp["s1"]:
-        score -= 1; signals["pivot"] = "below_S1_bearish"
+        score -= 1 * piv_w; signals["pivot"] = "below_S1_bearish"
     else:
         signals["pivot"] = "neutral"
+
+    # Score auf int runden für Kompatibilität
+    score = int(round(score))
 
     # Finales Signal
     if score >= 3:
