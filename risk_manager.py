@@ -108,6 +108,27 @@ class PercentBalanceStrategy(Strategy):
         return max(base * 0.5, balance * pct)
 
 
+class TargetRecoveryStrategy(Strategy):
+    """Erzwingt einen Session-Profit am Ende. Erhöht den Einsatz dynamisch, um alle Session-Verluste mit einem Trade auszugleichen."""
+    name = "target_recovery"
+
+    def next_amount(self, base: float, history: list[dict], params: dict) -> float:
+        net_profit = params.get("session_net_profit", 0.0)
+        payout = params.get("payout_ratio", 0.85)
+        
+        # Wenn wir im Plus sind, reicht der Base-Einsatz
+        if net_profit >= 0:
+            return base
+            
+        # Wenn wir im Minus sind: Wie viel Einsatz brauchen wir für Recovery + Base?
+        deficit = abs(net_profit)
+        # target_amount = (deficit + (gewünschter_profit)) / payout
+        target_amount = (deficit + (base * payout)) / payout
+        
+        # Zur Sicherheit: Max-Multiplier auf 10x begrenzen (wird ohnehin noch durch 10% Balance-Cap limitiert)
+        return min(target_amount, base * 10)
+
+
 STRATEGIES = {
     "flat": FlatStrategy(),
     "martingale": MartingaleStrategy(),
@@ -115,6 +136,7 @@ STRATEGIES = {
     "anti_martingale": AntiMartingaleStrategy(),
     "kelly": KellyStrategy(),
     "percent_balance": PercentBalanceStrategy(),
+    "target_recovery": TargetRecoveryStrategy(),
 }
 
 
@@ -158,13 +180,13 @@ class SessionStats:
     def roi(self) -> float:
         return self.net_profit / max(self.start_balance, 1) * 100
 
-    def record_trade(self, amount: float, status: str, balance_after: float):
+    def record_trade(self, amount: float, status: str, balance_after: float, payout_rate: float = 0.85):
         self.trades += 1
         self.current_balance = balance_after
 
         if status == "win":
             self.wins += 1
-            profit = amount * 0.85  # ~85% Payout
+            profit = amount * payout_rate
             self.total_profit += profit
             if self.current_streak > 0:
                 self.current_streak += 1
@@ -225,7 +247,7 @@ class RiskManager:
         )
 
         # Aktive Strategie + Parameter
-        self.strategy_name = "soft_martingale"
+        self.strategy_name = "target_recovery"
         self.params = {
             "martingale_multiplier": 2.0,
             "martingale_max_steps": 4,
@@ -253,7 +275,6 @@ class RiskManager:
 
     def reset_session(self, current_balance: float):
         """Setzt die Streaks und Drawdowns für eine neue Trainings-Session zurück."""
-        self.stats.start_balance = current_balance
         self.stats.current_balance = current_balance
         self.stats.peak_balance = current_balance
         self.stats.current_streak = 0
@@ -270,6 +291,7 @@ class RiskManager:
     def get_next_amount(self, history: list[dict], balance: float) -> float:
         """Berechnet den nächsten Einsatz basierend auf aktiver Strategie."""
         self.params["current_balance"] = balance
+        self.params["session_net_profit"] = self.stats.net_profit
         amount = self.strategy.next_amount(self.base_amount, history, self.params)
 
         # Safety Caps
@@ -302,9 +324,9 @@ class RiskManager:
 
         return True, "OK"
 
-    def record_result(self, amount: float, status: str, balance: float):
+    def record_result(self, amount: float, status: str, balance: float, payout_rate: float = 0.85):
         """Zeichnet Ergebnis auf und triggert ggf. Optimierung."""
-        self.stats.record_trade(amount, status, balance)
+        self.stats.record_trade(amount, status, balance, payout_rate)
         self.stats.strategy_used = self.strategy_name
 
         # Auto-Optimierung alle N Trades

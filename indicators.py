@@ -567,6 +567,29 @@ def analyze_all(candles: list[dict], weights: dict = None) -> dict:
     elif ema_cross["signal"] == "bearish":
         score -= 1 * ema_w; signals["ema_cross"] = "bearish"
 
+
+
+    # --- AI Dynamischer Indikator (Falls vorhanden) ---
+    try:
+        import sys
+        import os
+        if os.path.exists("ai_generated_indicator.py"):
+            import importlib
+            import ai_generated_indicator
+            importlib.reload(ai_generated_indicator)
+            
+            if hasattr(ai_generated_indicator, 'analyze'):
+                ai_res = ai_generated_indicator.analyze(candles)
+                if isinstance(ai_res, dict) and "score" in ai_res and "signal" in ai_res:
+                    ai_w = w.get("ai_indicator", 1.5)  # Etwas höhere Gewichtung initial
+                    score += float(ai_res["score"]) * ai_w
+                    signals["ai_indicator"] = ai_res["signal"]
+    except Exception as e:
+        signals["ai_indicator_error"] = str(e)
+
+    # Finale Entscheidung
+    final_signal = "neutral"
+
     # Momentum
     mom_w = w.get("momentum", 1.0)
     if mom is not None:

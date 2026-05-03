@@ -228,6 +228,8 @@ AUFGABEN:
 2. Bewerte ob JETZT ein guter Entry ist — BERÜCKSICHTIGE die gelernten Regeln oben!
 3. Passe das Risk Management an wenn nötig (Strategie, Limits, Parameter). WICHTIG: Das absolute Einsatz-Minimum (base_amount) ist 1.0$!
 4. Wenn du Muster aus vergangenen Trades erkennst, nutze sie!
+5. HAUPTZIEL: NACH JEDER SESSION (10 TRADES) IM PROFIT SEIN! Seitwärtsbewegungen sind inakzeptabel.
+6. PAYOUT-RATEN: Berücksichtige, dass Payouts auf OTC oft bei ~85% liegen. Passe die Strategie (z.B. anti_martingale oder kelly) dynamisch an, um Verluste auszugleichen und den Netto-Profit positiv zu halten.
 
 ANTWORT NUR ALS JSON:
 {{{{
@@ -499,23 +501,37 @@ async def trading_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                     # 6. Ergebnis
                     result = await client.check_win(trade_id)
                     status = "loss"
+                    real_profit = 0.0
+                    payout_rate = state.risk.params.get("payout_ratio", 0.85)
+
                     if isinstance(result, dict):
                         # check_win gibt {'result': 'win'/'loss', 'profit': ...} zurück
                         res_str = str(result.get("result", "")).lower()
                         if "win" in res_str:
                             status = "win"
+                            real_profit = float(result.get("profit", 0))
                         else:
                             try:
-                                profit = float(result.get("profit", 0))
-                                if profit > 0:
+                                real_profit = float(result.get("profit", 0))
+                                if real_profit > 0:
                                     status = "win"
                             except (ValueError, TypeError):
                                 pass
                     elif "win" in str(result).lower():
                         status = "win"
 
+                    # Wenn wir den echten Profit von der API haben, berechnen wir die aktuelle Payout-Rate
+                    if status == "win" and real_profit > 0 and trade_amount > 0:
+                        # Fall 1: API gibt Netto-Profit zurück (z.B. 0.85 bei 1$ Einsatz)
+                        if real_profit < trade_amount:
+                            payout_rate = real_profit / trade_amount
+                        # Fall 2: API gibt Gesamt-Rückzahlung zurück (z.B. 1.85 bei 1$ Einsatz)
+                        else:
+                            payout_rate = (real_profit - trade_amount) / trade_amount
+                        state.risk.params["payout_ratio"] = payout_rate
+
                     new_bal = await client.balance()
-                    state.risk.record_result(trade_amount, status, new_bal)
+                    state.risk.record_result(trade_amount, status, new_bal, payout_rate)
 
                     trade_entry = {
                         "trade_number": state.current_trade,
@@ -755,6 +771,33 @@ async def continuous_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⏹ Endlos-Modus *deaktiviert*.", parse_mode="Markdown")
 
+async def clean_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resets only performance stats, keeps AI memory and learned settings."""
+    if state.is_running:
+        await update.message.reply_text("Bitte zuerst /stop_bot ausführen.")
+        return
+    
+    # 1. Aktuelle Balance holen, um den Startpunkt neu zu setzen
+    current_balance = 0.0
+    if state.risk and state.risk.stats:
+        current_balance = state.risk.stats.current_balance
+        
+    # 2. Risk Stats komplett nullen, aber Settings (Strategy etc) behalten
+    from risk_manager import SessionStats
+    state.risk.stats = SessionStats(
+        start_balance=current_balance,
+        current_balance=current_balance,
+        peak_balance=current_balance
+    )
+    state.risk.save_state()
+    
+    # 3. AI Memory Stats nullen, aber Gelerntes behalten
+    if "stats" in state.memory.data:
+        state.memory.data["stats"] = {"total_trades": 0, "total_wins": 0, "total_losses": 0, "total_sessions": 0}
+        state.memory.save()
+        
+    await update.message.reply_text("🗑 *Stats (Profit, Win-Rate, Trades) wurden auf 0 gesetzt.*\n\n🧠 Das Gelernte der KI (Regeln & Gewichte) bleibt natürlich erhalten!", parse_mode="Markdown")
+
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fetcht Balance von Demo UND Real Account mit Timeout."""
     await update.message.reply_text("💰 Lade Kontostände... (max 15s)")
@@ -826,9 +869,9 @@ def main():
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("memory", memory_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("clean", clean_cmd))
     logger.info("Bot startet...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-

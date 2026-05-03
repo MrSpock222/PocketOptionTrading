@@ -289,6 +289,11 @@ DEINE AUFGABEN:
 3. LERNE daraus: Formuliere konkrete Regeln für die Zukunft
 4. PASSE Indikator-Gewichte an: Welche Indikatoren sollten stärker/schwächer gewichtet werden?
 5. SCHLAGE neue Strategien vor: Was könnte die Performance verbessern?
+6. PROFIT-FOKUS & PAYOUTS: Dein HAUPTZIEL ist eine positive Netto-Rendite. Bedenke, dass die Payout-Rate auf OTC meist nur bei ~85% liegt. Eine Win-Rate von 50% führt zu Verlusten! Passe das Risk-Management und die Einstiegsregeln rigoros an, um Seitwärtsbewegungen zu eliminieren und den Profit zu erzwingen.
+7. EIGENE INDIKATOREN: Du kannst eigenen Python-Code generieren, der in der nächsten Session live genutzt wird!
+   Nutze dafür das Feld "new_indicator_code". Der Code MUSS eine Funktion `analyze(candles: list[dict]) -> dict:` exportieren,
+   die `{{"score": 1.0, "signal": "bullish"}}` (oder -1.0 und bearish) zurückgibt. `candles` enthält `['open', 'high', 'low', 'close', 'volume']`.
+   WICHTIG: Falls in den Trades unter 'indicators' ein 'ai_indicator_error' steht, gab es einen Syntax- oder Laufzeitfehler in deinem letzten Code! Analysiere den Fehlertext und korrigiere deinen Code in der neuen Antwort!
 
 ANTWORT NUR ALS JSON:
 {{{{
@@ -313,11 +318,11 @@ ANTWORT NUR ALS JSON:
       "based_on": "Aus welchen Trades abgeleitet"
     }}}}
   ],
-  "indicator_weight_changes": {{{{
-    "rsi": 1.0,
-    "macd": 1.2,
-    "bollinger": 0.8
-  }}}},
+  "indicator_adjustments": {{
+    "indicator_name": 1.5,
+    "another_indicator": 0.8
+  }},
+  "new_indicator_code": "def analyze(candles):\n    if len(candles) < 2: return {{'score': 0, 'signal': 'neutral'}}\n    last_c = candles[-1]['close']\n    return {{'score': 1.0, 'signal': 'bullish'}}\n",
   "strategy_suggestions": [
     "Vorschlag 1",
     "Vorschlag 2"
