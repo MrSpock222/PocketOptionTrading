@@ -239,11 +239,11 @@ ANTWORT NUR ALS JSON:
   "override_local": true/false,
   "preferred_asset": "{best.get('asset', '')}",
   "risk_adjustments": {{
-    "strategy": "soft_martingale"/"kelly"/"flat"/"anti_martingale"/"percent_balance",
+    "strategy": "target_recovery"/"soft_martingale"/"kelly"/"flat"/"percent_balance",
     "base_amount": 1.0,
     "max_drawdown": 15.0,
     "min_confidence": 0.3,
-    "params": {{}}
+    "params": {{"max_martingale_steps": 3}}
   }}
 }}}}"""
 
@@ -381,60 +381,85 @@ async def trading_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
             while state.is_running:
                 state.current_trade = 0
+                state.martingale_step = 0
                 state.session_start_balance = balance
                 session_trades = []
+                current_asset = None
+                current_action = None
+                current_best = None
 
                 while state.is_running and state.current_trade < state.max_trades:
+                    is_follow_up = state.martingale_step > 0
 
-                    # 1. ALLE OTC-Paare scannen
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🔍 Trade {state.current_trade + 1}/{state.max_trades} — Scanne alle OTC-Paare...",
-                    )
-                    scan_results = await scanner.scan_all(client, weights=state.memory.get_weights())
-                    scan_summary = scanner.format_scan_summary(scan_results)
-                    await context.bot.send_message(chat_id=chat_id, text=scan_summary, parse_mode="Markdown")
-
-                    # 2. Besten Entry finden
-                    best = scanner.find_best_entry(scan_results)
-                    if not best:
+                    if not is_follow_up:
+                        # 1. ALLE OTC-Paare scannen
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text="⏳ Kein klarer Entry — warte 30s und scanne erneut...",
+                            text=f"🔍 Sequenz {state.current_trade + 1}/{state.max_trades} — Scanne alle OTC-Paare...",
                         )
-                        await asyncio.sleep(30)
-                        continue
+                        scan_results = await scanner.scan_all(client, weights=state.memory.get_weights())
+                        scan_summary = scanner.format_scan_summary(scan_results)
+                        await context.bot.send_message(chat_id=chat_id, text=scan_summary, parse_mode="Markdown")
 
-                    # 3. NemoClaw KI fragen — mit Risk-State
-                    current_balance = await client.balance()
-                    risk_state = state.risk.get_state_for_ai()
-                    ai_response = await state.nemoclaw.analyze(
-                        best, scan_results, state.history, current_balance, risk_state
-                    )
-
-                    # KI Risk-Anpassungen anwenden
-                    if ai_response and ai_response.get("risk_adjustments"):
-                        changes = state.risk.apply_ai_adjustments(ai_response["risk_adjustments"])
-                        if changes:
+                        # 2. Besten Entry finden
+                        best = scanner.find_best_entry(scan_results)
+                        if not best:
                             await context.bot.send_message(
                                 chat_id=chat_id,
-                                text=f"🔧 *KI Risk-Anpassung:*\n" + "\n".join(f"  • {_esc_md(c)}" for c in changes),
-                                parse_mode="Markdown",
+                                text="⏳ Kein klarer Entry — warte 30s und scanne erneut...",
                             )
+                            await asyncio.sleep(30)
+                            continue
 
-                    # KI kann ein anderes Asset vorschlagen
-                    asset = best["asset"]
-                    if ai_response and ai_response.get("preferred_asset"):
-                        preferred = ai_response["preferred_asset"]
-                        # Prüfe ob das vorgeschlagene Asset in den Scan-Ergebnissen ist
-                        for r in scan_results:
-                            if r["asset"] == preferred:
-                                asset = preferred
-                                best = r
-                                break
+                        # 3. NemoClaw KI fragen — mit Risk-State
+                        current_balance = await client.balance()
+                        risk_state = state.risk.get_state_for_ai()
+                        ai_response = await state.nemoclaw.analyze(
+                            best, scan_results, state.history, current_balance, risk_state
+                        )
 
-                    # 4. Prediction kombinieren
-                    action, confidence, reasoning = build_prediction(best, ai_response)
+                        # KI Risk-Anpassungen anwenden
+                        if ai_response and ai_response.get("risk_adjustments"):
+                            changes = state.risk.apply_ai_adjustments(ai_response["risk_adjustments"])
+                            if changes:
+                                await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"🔧 *KI Risk-Anpassung:*\n" + "\n".join(f"  • {_esc_md(c)}" for c in changes),
+                                    parse_mode="Markdown",
+                                )
+
+                        # KI kann ein anderes Asset vorschlagen
+                        asset = best["asset"]
+                        if ai_response and ai_response.get("preferred_asset"):
+                            preferred = ai_response["preferred_asset"]
+                            # Prüfe ob das vorgeschlagene Asset in den Scan-Ergebnissen ist
+                            for r in scan_results:
+                                if r["asset"] == preferred:
+                                    asset = preferred
+                                    best = r
+                                    break
+
+                        # 4. Prediction kombinieren
+                        action, confidence, reasoning = build_prediction(best, ai_response)
+                        
+                        current_asset = asset
+                        current_action = action
+                        current_best = best
+                    else:
+                        # Follow-Up (Nachtrade)
+                        asset = current_asset
+                        action = current_action
+                        best = current_best
+                        confidence = 1.0
+                        reasoning = f"Nachtrade (Schritt {state.martingale_step}) auf gleichem Signal"
+                        ai_response = None
+                        scan_results = []
+                        current_balance = await client.balance()
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"🔄 *NACHTRADE {state.martingale_step}* für {_esc_md(asset)} ({action.upper()})...",
+                            parse_mode="Markdown"
+                        )
 
                     # Risk Check: Darf getradet werden?
                     can_trade, risk_reason = state.risk.should_trade(confidence, current_balance)
@@ -449,26 +474,37 @@ async def trading_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                             # um eine KI-Analyse zu erzwingen und danach weiter zu lernen!
                             break
                         await asyncio.sleep(15)
+                        if is_follow_up:
+                            # Abbruch der Sequenz
+                            state.current_trade += 1
+                            state.martingale_step = 0
                         continue
 
                     # Einsatz vom Risk Manager berechnen
                     trade_amount = state.risk.get_next_amount(state.history, current_balance)
-                    state.current_trade += 1
 
                     ind = best.get("indicators", {})
                     subs = best.get("sub_signals", {})
                     buy_n = sum(1 for v in subs.values() if "BUY" in str(v) or "bullish" in str(v))
                     sell_n = sum(1 for v in subs.values() if "SELL" in str(v) or "bearish" in str(v))
 
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
+                    if not is_follow_up:
+                        msg_text = (
                             f"🎯 *{_esc_md(asset)}* → *{action.upper()}*\n"
                             f"Konfidenz: {confidence:.0%} | Score: {best.get('score', 0)}\n"
                             f"💡 {_esc_md(reasoning)}\n"
                             f"💵 Einsatz: ${trade_amount:.2f} ({_esc_md(state.risk.strategy_name)})\n"
                             f"RSI:{ind.get('rsi_14','?')} BB:{ind.get('bollinger',{}).get('percent_b','?')}"
-                        ),
+                        )
+                    else:
+                        msg_text = (
+                            f"🎯 *{_esc_md(asset)}* → *{action.upper()}* (NACHTRADE {state.martingale_step})\n"
+                            f"💵 Einsatz: ${trade_amount:.2f} ({_esc_md(state.risk.strategy_name)})"
+                        )
+
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=msg_text,
                         parse_mode="Markdown",
                     )
 
@@ -485,10 +521,13 @@ async def trading_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                     except Exception as e:
                         await context.bot.send_message(
                             chat_id=chat_id,
-                            text=f"⚠️ *Trade fehlgeschlagen:* `{_esc_md(str(e))}`\nGehe zum nächsten Scan...",
+                            text=f"⚠️ *Trade fehlgeschlagen:* `{_esc_md(str(e))}`\nGehe zum nächsten...",
                             parse_mode="Markdown",
                         )
-                        state.current_trade -= 1  # Trade wurde nicht ausgeführt
+                        await asyncio.sleep(5)
+                        if is_follow_up:
+                            state.current_trade += 1
+                            state.martingale_step = 0
                         await asyncio.sleep(5)
                         continue
 
@@ -534,7 +573,7 @@ async def trading_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                     state.risk.record_result(trade_amount, status, new_bal, payout_rate)
 
                     trade_entry = {
-                        "trade_number": state.current_trade,
+                        "trade_number": f"{state.current_trade+1}.{state.martingale_step}",
                         "trade_id": str(trade_id),
                         "asset": asset,
                         "amount": trade_amount,
@@ -561,28 +600,35 @@ async def trading_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                         balance_after=new_bal,
                     )
 
-                    # 7. Ergebnis-Meldung
-                    if status == "loss":
+                    # 7. Sequenz Logik & Ergebnis-Meldung
+                    max_steps = state.risk.params.get("max_martingale_steps", 3)
+                    
+                    if status == "win":
+                        state.current_trade += 1
+                        state.martingale_step = 0
                         next_amt = state.risk.get_next_amount(state.history, new_bal)
-                        msg = f"❌ *VERLUST* | Nächster: ${next_amt:.2f} ({_esc_md(state.risk.strategy_name)})"
+                        msg = f"✅ *GEWINN* | Sequenz {state.current_trade} abgeschlossen. Nächster: ${next_amt:.2f}"
                     else:
-                        next_amt = state.risk.get_next_amount(state.history, new_bal)
-                        msg = f"✅ *GEWINN* | Nächster: ${next_amt:.2f}"
+                        state.martingale_step += 1
+                        if state.martingale_step > max_steps:
+                            state.current_trade += 1
+                            state.martingale_step = 0
+                            msg = f"❌ *VERLUST* | Max Nachtrades ({max_steps}) erreicht. Gehe zu Sequenz {state.current_trade+1}."
+                        else:
+                            msg = f"❌ *VERLUST* | Starte Nachtrade {state.martingale_step}/{max_steps}..."
 
                     dd = state.risk.stats.current_drawdown_pct
                     await context.bot.send_message(
                         chat_id=chat_id,
-                    text=f"{msg}\n💰 ${new_bal} | DD: {dd:.1f}%",
-                    parse_mode="Markdown",
-                )
-
-                state.risk.save_state()
-                await asyncio.sleep(2)
-
-                await asyncio.sleep(2)
+                        text=f"{msg}\n💰 ${new_bal} | DD: {dd:.1f}%",
+                        parse_mode="Markdown",
+                    )
+                    
+                    state.risk.save_state()
+                    await asyncio.sleep(2)
 
                 # Session-Ende / Post-Session Analysis
-                if state.is_running:
+                if session_trades:
                     final = await client.balance()
                     summary = state.risk.stats.to_summary()
                     await context.bot.send_message(
@@ -599,7 +645,7 @@ async def trading_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                     # ====================================================
                     # POST-SESSION AI REVIEW — Selbstlernende KI-Analyse
                     # ====================================================
-                    if session_trades and len(session_trades) >= 2:
+                    if session_trades and len(session_trades) >= 1:
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text="🧠 *KI analysiert die Session...*\nLerne aus Gewinnen und Fehlern...",

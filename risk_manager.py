@@ -116,16 +116,32 @@ class TargetRecoveryStrategy(Strategy):
         net_profit = params.get("session_net_profit", 0.0)
         payout = params.get("payout_ratio", 0.85)
         
-        # Wenn wir im Plus sind, reicht der Base-Einsatz
-        if net_profit >= 0:
+        # Wenn wir im Minus sind: Wie viel Einsatz brauchen wir für Recovery + Base?
+        # Auch wenn wir im Plus sind, aber der letzte Trade ein Verlust war, wollen wir diesen EINEN Verlust 
+        # ggf. schneller zurückholen (Nachtrade-Logik).
+        
+        deficit = 0.0
+        if net_profit < 0:
+            deficit = abs(net_profit)
+        else:
+            # Check ob wir in einer Verlustserie sind (für Nachtrades innerhalb einer Sequenz)
+            last_losses = 0.0
+            for t in reversed(history):
+                if t.get("status") == "loss":
+                    last_losses += float(t.get("amount", 0))
+                else:
+                    break
+            deficit = last_losses
+
+        if deficit <= 0:
             return base
             
-        # Wenn wir im Minus sind: Wie viel Einsatz brauchen wir für Recovery + Base?
-        deficit = abs(net_profit)
-        # target_amount = (deficit + (gewünschter_profit)) / payout
+        # target_amount = (deficit + (base * payout)) / payout
         target_amount = (deficit + (base * payout)) / payout
         
-        # Zur Sicherheit: Max-Multiplier auf 10x begrenzen (wird ohnehin noch durch 10% Balance-Cap limitiert)
+        logger.info(f"TargetRecovery: Deficit={deficit:.2f}, Payout={payout:.2f}, Result={target_amount:.2f}")
+        
+        # Zur Sicherheit: Max-Multiplier auf 10x begrenzen
         return min(target_amount, base * 10)
 
 
@@ -251,6 +267,7 @@ class RiskManager:
         self.params = {
             "martingale_multiplier": 2.0,
             "martingale_max_steps": 4,
+            "max_martingale_steps": 3,
             "soft_multiplier": 1.5,
             "soft_max_steps": 5,
             "anti_multiplier": 1.5,
